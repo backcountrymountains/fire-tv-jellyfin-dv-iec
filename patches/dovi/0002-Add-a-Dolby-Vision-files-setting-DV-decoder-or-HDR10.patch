@@ -1,0 +1,407 @@
+From 7cfcd31600f2b50a32f43dec46013bf4a1ff5261 Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 08:34:09 -0700
+Subject: [PATCH 2/2] Add a "Dolby Vision files" setting: DV decoder or
+ HDR10/HDR10+ base layer
+
+On a TV without Dolby Vision the device's DV engine renders DV to plain
+HDR10, which drops any HDR10+ metadata in hybrid files. Let the user
+choose how DV files are decoded:
+
+- Dolby Vision decoder (default, unchanged behaviour)
+- Base layer on the HEVC decoder, keeping HDR10+
+- Base layer as plain HDR10, with the HDR10+ SEI messages removed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../androidtv/preference/UserPreferences.kt   |   6 +
+ .../preference/constant/DoviOutputMode.kt     |  15 ++
+ .../androidtv/ui/playback/VideoManager.java   |   5 +
+ .../SettingsPlaybackHdrOverridesScreen.kt     |  22 +++
+ app/src/main/res/values/strings.xml           |   4 +
+ .../exoplayer/dovi/DvVideoRenderer.java       | 146 +++++++++++++++++-
+ .../src/test/kotlin/dovi/Hdr10PlusSeiTests.kt |  56 +++++++
+ 7 files changed, 253 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/org/jellyfin/androidtv/preference/constant/DoviOutputMode.kt
+ create mode 100644 playback/media3/exoplayer/src/test/kotlin/dovi/Hdr10PlusSeiTests.kt
+
+diff --git a/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt b/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
+index 4ef6bd124..c396a4a20 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
+@@ -6,6 +6,7 @@ import org.jellyfin.androidtv.preference.UserPreferences.Companion.screensaverIn
+ import org.jellyfin.androidtv.preference.constant.AVCLevel
+ import org.jellyfin.androidtv.preference.constant.AppTheme
+ import org.jellyfin.androidtv.preference.constant.AudioBehavior
++import org.jellyfin.androidtv.preference.constant.DoviOutputMode
+ import org.jellyfin.androidtv.preference.constant.BackdropBehavior
+ import org.jellyfin.androidtv.preference.constant.BitstreamAudioMode
+ import org.jellyfin.androidtv.preference.constant.BufferLength
+@@ -164,6 +165,11 @@ class UserPreferences(context: Context) : SharedPreferenceStore(
+ 		 */
+ 		var hdr10PlusOverride = enumPreference("hdr10_plus_override", HdrOverrideMode.AUTO)
+ 
++		/**
++		 * decode Dolby Vision files with the DV decoder or as their HDR10/HDR10+ base layer.
++		 */
++		var doviOutputMode = enumPreference("dovi_output_mode", DoviOutputMode.DOLBY_VISION)
++
+ 		/**
+ 		 * Dolby Vision Profile 5 device profile override.
+ 		 */
+diff --git a/app/src/main/java/org/jellyfin/androidtv/preference/constant/DoviOutputMode.kt b/app/src/main/java/org/jellyfin/androidtv/preference/constant/DoviOutputMode.kt
+new file mode 100644
+index 000000000..24ca95e09
+--- /dev/null
++++ b/app/src/main/java/org/jellyfin/androidtv/preference/constant/DoviOutputMode.kt
+@@ -0,0 +1,15 @@
++package org.jellyfin.androidtv.preference.constant
++
++import org.jellyfin.androidtv.R
++import org.jellyfin.preference.PreferenceEnum
++
++/**
++ * which decoder plays a Dolby Vision file that also has an HDR10/HDR10+ base layer.
++ */
++enum class DoviOutputMode(
++	override val nameRes: Int,
++) : PreferenceEnum {
++	DOLBY_VISION(R.string.dovi_output_dolby_vision),
++	BASE_LAYER(R.string.dovi_output_base_layer),
++	BASE_LAYER_HDR10(R.string.dovi_output_base_layer_hdr10),
++}
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+index c2ec8c19f..411dd31d8 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+@@ -38,6 +38,7 @@ import androidx.media3.exoplayer.Renderer;
+ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+ import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
+ import androidx.media3.exoplayer.video.VideoRendererEventListener;
++import org.jellyfin.androidtv.preference.constant.DoviOutputMode;
+ import org.jellyfin.playback.media3.exoplayer.dovi.DvVideoRenderer;
+ import androidx.media3.exoplayer.ExoPlayer;
+ import androidx.media3.exoplayer.analytics.AnalyticsListener;
+@@ -246,6 +247,10 @@ public class VideoManager {
+                 }
+             }
+         };
++        // Dolby Vision files: the DV decoder, or the HDR10 base layer on the HEVC decoder (with or without its HDR10+ metadata)
++        DoviOutputMode doviOutputMode = userPreferences.get(UserPreferences.Companion.getDoviOutputMode());
++        DvVideoRenderer.preferBaseLayer = doviOutputMode != DoviOutputMode.DOLBY_VISION;
++        DvVideoRenderer.stripHdr10Plus = doviOutputMode == DoviOutputMode.BASE_LAYER_HDR10;
+         defaultRendererFactory.setEnableDecoderFallback(true);
+         defaultRendererFactory.setExtensionRendererMode(determineExoPlayerExtensionRendererMode());
+ 
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackHdrOverridesScreen.kt b/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackHdrOverridesScreen.kt
+index 5f3b1f712..31dbe1e00 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackHdrOverridesScreen.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackHdrOverridesScreen.kt
+@@ -2,10 +2,13 @@ package org.jellyfin.androidtv.ui.settings.screen.playback
+ 
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.res.stringResource
+ import org.jellyfin.androidtv.R
+ import org.jellyfin.androidtv.preference.UserPreferences
++import org.jellyfin.androidtv.preference.constant.DoviOutputMode
+ import org.jellyfin.androidtv.preference.constant.HdrFormat
+ import org.jellyfin.androidtv.ui.base.Text
+ import org.jellyfin.androidtv.ui.base.list.ListButton
+@@ -13,6 +16,7 @@ import org.jellyfin.androidtv.ui.base.list.ListSection
+ import org.jellyfin.androidtv.ui.navigation.LocalRouter
+ import org.jellyfin.androidtv.ui.navigation.focus.focusKey
+ import org.jellyfin.androidtv.ui.settings.Routes
++import org.jellyfin.androidtv.ui.settings.compat.rememberPreference
+ import org.jellyfin.androidtv.ui.settings.composable.SettingsColumn
+ import org.koin.compose.koinInject
+ 
+@@ -45,5 +49,23 @@ fun SettingsPlaybackHdrOverridesScreen() {
+ 				modifier = Modifier.focusKey("hdr_overrides_${format.name}")
+ 			)
+ 		}
++
++		// DV decoder vs HDR10/HDR10+ base layer; a click toggles
++		item {
++			var doviOutputMode by rememberPreference(userPreferences, UserPreferences.doviOutputMode)
++
++			ListButton(
++				headingContent = { Text(stringResource(R.string.dovi_output_mode)) },
++				captionContent = { Text(stringResource(doviOutputMode.nameRes)) },
++				onClick = {
++					doviOutputMode = when (doviOutputMode) {
++						DoviOutputMode.DOLBY_VISION -> DoviOutputMode.BASE_LAYER
++						DoviOutputMode.BASE_LAYER -> DoviOutputMode.BASE_LAYER_HDR10
++						DoviOutputMode.BASE_LAYER_HDR10 -> DoviOutputMode.DOLBY_VISION
++					}
++				},
++				modifier = Modifier.focusKey("hdr_overrides_dovi_output_mode")
++			)
++		}
+ 	}
+ }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 123b301c2..268cc02ad 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -193,6 +193,10 @@
+     <string name="hdr10_override_description">Static HDR metadata</string>
+     <string name="hdr10_plus_override">HDR10+</string>
+     <string name="hdr10_plus_override_description">Dynamic HDR metadata</string>
++    <string name="dovi_output_mode">Dolby Vision files</string>
++    <string name="dovi_output_dolby_vision">Dolby Vision decoder</string>
++    <string name="dovi_output_base_layer">HDR10 / HDR10+ base layer</string>
++    <string name="dovi_output_base_layer_hdr10">HDR10 base layer (HDR10+ removed)</string>
+     <string name="dovi_profile_5">Dolby Vision Profile 5</string>
+     <string name="dovi_profile_5_description">Single-layer Dolby Vision</string>
+     <string name="dovi_profile_7">Dolby Vision Profile 7</string>
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
+index 9be26e91b..6aaef2029 100644
+--- a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
+@@ -9,8 +9,12 @@ import androidx.media3.common.MimeTypes;
+ import androidx.media3.common.util.UnstableApi;
+ import androidx.media3.decoder.DecoderInputBuffer;
+ import androidx.media3.exoplayer.ExoPlaybackException;
++import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
++import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
+ import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
+ import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ import timber.log.Timber;
+ 
+@@ -30,10 +34,42 @@ public final class DvVideoRenderer extends MediaCodecVideoRenderer {
+ 	/** Convert profile 7 (FEL/MEL) to 8.1 with libdovi; otherwise the DV decoder shows only the HDR10 base layer. */
+ 	static boolean convertP7 = true;
+ 
++	/** play DV files on the plain HEVC decoder (RPU/EL stripped), so the HDR10/HDR10+ base layer is output. */
++	public static volatile boolean preferBaseLayer = false;
++
+ 	public DvVideoRenderer(Builder builder) {
+ 		super(builder);
+ 	}
+ 
++	@Override
++	protected List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> getDecoderInfos(MediaCodecSelector mediaCodecSelector,
++			Format format, boolean requiresSecureDecoder) throws MediaCodecUtil.DecoderQueryException {
++		List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> infos =
++				super.getDecoderInfos(mediaCodecSelector, format, requiresSecureDecoder);
++		if (!MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)) return infos;
++		List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> out = infos;
++		if (preferBaseLayer) {
++			out = new ArrayList<>();
++			for (androidx.media3.exoplayer.mediacodec.MediaCodecInfo i : infos) {
++				if (!MimeTypes.VIDEO_DOLBY_VISION.equals(i.mimeType)) out.add(i);
++			}
++			// No HEVC alternative listed (e.g. profile 7): ask for HEVC decoders directly
++			if (out.isEmpty()) out = mediaCodecSelector.getDecoderInfos(MimeTypes.VIDEO_H265, requiresSecureDecoder, false);
++		}
++		Timber.i("DV %s mode=%s offered=%s using=%s", format.codecs,
++				preferBaseLayer ? (stripHdr10Plus ? "base-layer-hdr10" : "base-layer") : "dolby-vision", names(infos), names(out));
++		return out;
++	}
++
++	private static String names(List<androidx.media3.exoplayer.mediacodec.MediaCodecInfo> infos) {
++		StringBuilder sb = new StringBuilder("[");
++		for (androidx.media3.exoplayer.mediacodec.MediaCodecInfo i : infos) {
++			if (sb.length() > 1) sb.append(", ");
++			sb.append(i.name).append('/').append(i.mimeType);
++		}
++		return sb.append(']').toString();
++	}
++
+ 	private static boolean isP7(@Nullable Format f) {
+ 		return f != null && MimeTypes.VIDEO_DOLBY_VISION.equals(f.sampleMimeType) && f.codecs != null && f.codecs.startsWith("dvhe.07");
+ 	}
+@@ -64,12 +100,120 @@ public final class DvVideoRenderer extends MediaCodecVideoRenderer {
+ 			if (samples++ % 500 == 0) Timber.i("P7 -> P8.1 on %s: %d RPUs converted, %d failed, %d samples", info.name, converted, failed, samples);
+ 			return;
+ 		}
+-		if (!MimeTypes.VIDEO_H265.equals(info.mimeType) || !MimeTypes.VIDEO_DOLBY_VISION.equals(in.sampleMimeType)) return;
++		if (!MimeTypes.VIDEO_H265.equals(info.mimeType)) return;
++		if (stripHdr10Plus) {
++			hdr10PlusRemoved += stripHdr10PlusSei(buffer.data);
++			if (MimeTypes.VIDEO_DOLBY_VISION.equals(in.sampleMimeType)) stripped += stripDvNals(buffer.data);
++			if (samples++ % 500 == 0) Timber.i("HEVC on %s: removed %d HDR10+ SEI messages, stripped %d bytes of NAL 62/63 over %d samples",
++					info.name, hdr10PlusRemoved, stripped, samples);
++			return;
++		}
++		if (!MimeTypes.VIDEO_DOLBY_VISION.equals(in.sampleMimeType)) return;
+ 		int removed = stripDvNals(buffer.data);
+ 		stripped += removed;
+ 		if (samples++ % 500 == 0) Timber.i("DV on %s: stripped NAL 62/63, %d bytes over %d samples", info.name, stripped, samples);
+ 	}
+ 
++	/** remove HDR10+ (ST 2094-40) SEI messages from HEVC samples so the output is plain HDR10. */
++	public static volatile boolean stripHdr10Plus = false;
++	private long hdr10PlusRemoved;
++
++	/** Rewrites prefix SEI NALs (type 39) in place without their HDR10+ messages; returns messages removed. */
++	static int stripHdr10PlusSei(ByteBuffer b) {
++		int start = b.position(), end = b.limit();
++		byte[] src = new byte[end - start];
++		b.duplicate().get(src);
++		java.util.ArrayList<int[]> nals = new java.util.ArrayList<>(); // {startCodeStart, payloadStart}
++		for (int i = 0; i + 3 <= src.length; ) {
++			if (src[i] == 0 && src[i + 1] == 0 && src[i + 2] == 1) {
++				nals.add(new int[] {(i > 0 && src[i - 1] == 0) ? i - 1 : i, i + 3});
++				i += 3;
++			} else {
++				i++;
++			}
++		}
++		int removedTotal = 0;
++		java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(src.length);
++		for (int k = 0; k < nals.size(); k++) {
++			int sc = nals.get(k)[0], p = nals.get(k)[1];
++			int e = k + 1 < nals.size() ? nals.get(k + 1)[0] : src.length;
++			int type = p < e ? (src[p] >> 1) & 0x3f : -1;
++			if (type == 39 && e - p > 2) {
++				int[] removed = new int[1];
++				byte[] nal = rewriteSei(java.util.Arrays.copyOfRange(src, p, e), removed);
++				if (removed[0] > 0) {
++					removedTotal += removed[0];
++					if (nal != null) {
++						out.write(src, sc, p - sc);
++						out.write(nal, 0, nal.length);
++					}
++					continue;
++				}
++			}
++			out.write(src, sc, e - sc);
++		}
++		if (removedTotal == 0) return 0;
++		byte[] o = out.toByteArray();
++		b.limit(b.capacity());
++		b.position(start);
++		b.put(o);
++		b.limit(start + o.length);
++		b.position(start);
++		return removedTotal;
++	}
++
++	/** SEI NAL (header included) without HDR10+ messages; null if nothing is left. removed[0] = messages dropped. */
++	static byte[] rewriteSei(byte[] nal, int[] removed) {
++		java.io.ByteArrayOutputStream rbsp = new java.io.ByteArrayOutputStream(nal.length);
++		int zeros = 0;
++		for (int i = 2; i < nal.length; i++) { // drop emulation prevention bytes
++			int v = nal[i] & 0xff;
++			if (zeros >= 2 && v == 3) { zeros = 0; continue; }
++			zeros = v == 0 ? zeros + 1 : 0;
++			rbsp.write(v);
++		}
++		byte[] r = rbsp.toByteArray();
++		int n = r.length;
++		while (n > 0 && r[n - 1] == 0) n--; // trailing zero bytes
++		n--; // rbsp_stop_one_bit byte (0x80)
++		java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream(n);
++		int pos = 0, keptCount = 0;
++		while (pos < n) {
++			int msgStart = pos, payloadType = 0, payloadSize = 0;
++			while (pos < n && (r[pos] & 0xff) == 0xff) { payloadType += 255; pos++; }
++			if (pos >= n) return nal;
++			payloadType += r[pos++] & 0xff;
++			while (pos < n && (r[pos] & 0xff) == 0xff) { payloadSize += 255; pos++; }
++			if (pos >= n) return nal;
++			payloadSize += r[pos++] & 0xff;
++			if (pos + payloadSize > n) return nal; // malformed: leave the NAL alone
++			boolean hdr10Plus = payloadType == 4 && payloadSize >= 6 && (r[pos] & 0xff) == 0xb5 && r[pos + 1] == 0x00
++					&& r[pos + 2] == 0x3c && r[pos + 3] == 0x00 && r[pos + 4] == 0x01 && r[pos + 5] == 0x04;
++			pos += payloadSize;
++			if (hdr10Plus) {
++				removed[0]++;
++			} else {
++				kept.write(r, msgStart, pos - msgStart);
++				keptCount++;
++			}
++		}
++		if (removed[0] == 0) return nal;
++		if (keptCount == 0) return null;
++		kept.write(0x80);
++		byte[] k = kept.toByteArray();
++		java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream(k.length + 8);
++		o.write(nal[0]);
++		o.write(nal[1]);
++		zeros = 0;
++		for (byte x : k) { // re-insert emulation prevention bytes
++			int v = x & 0xff;
++			if (zeros >= 2 && v <= 3) { o.write(3); zeros = 0; }
++			o.write(v);
++			zeros = v == 0 ? zeros + 1 : 0;
++		}
++		return o.toByteArray();
++	}
++
+ 	/** Drops EL NALs (63) and replaces RPU NALs (62) with libdovi's P8.1 conversion; returns {converted, failed}. */
+ 	static int[] convertP7Sample(ByteBuffer b) {
+ 		int start = b.position(), end = b.limit();
+diff --git a/playback/media3/exoplayer/src/test/kotlin/dovi/Hdr10PlusSeiTests.kt b/playback/media3/exoplayer/src/test/kotlin/dovi/Hdr10PlusSeiTests.kt
+new file mode 100644
+index 000000000..ff8653c45
+--- /dev/null
++++ b/playback/media3/exoplayer/src/test/kotlin/dovi/Hdr10PlusSeiTests.kt
+@@ -0,0 +1,56 @@
++package org.jellyfin.playback.media3.exoplayer.dovi
++
++import io.kotest.core.spec.style.FunSpec
++import io.kotest.matchers.shouldBe
++import java.nio.ByteBuffer
++
++// HDR10+ SEI removal
++class Hdr10PlusSeiTests : FunSpec({
++	val header = byteArrayOf(0x4e, 0x01) // prefix SEI, layer 0, tid 1
++	// mastering display colour volume (137), 24 bytes, with two zeros followed by 0x01 -> needs an emulation byte
++	val mdcvPayload = ByteArray(24) { i -> if (i == 5) 1 else 0 }
++	val mdcv = byteArrayOf(137.toByte(), 24) + mdcvPayload
++	val hdr10Plus = byteArrayOf(4, 8, 0xb5.toByte(), 0x00, 0x3c, 0x00, 0x01, 0x04, 0x01, 0x40)
++
++	fun escape(rbsp: ByteArray): ByteArray {
++		val out = java.io.ByteArrayOutputStream()
++		var zeros = 0
++		for (b in rbsp) {
++			val v = b.toInt() and 0xff
++			if (zeros >= 2 && v <= 3) { out.write(3); zeros = 0 }
++			out.write(v)
++			zeros = if (v == 0) zeros + 1 else 0
++		}
++		return out.toByteArray()
++	}
++
++	fun nal(vararg messages: ByteArray) = header + escape(messages.fold(ByteArray(0)) { a, m -> a + m } + byteArrayOf(0x80.toByte()))
++
++	test("drops only the HDR10+ message and keeps the static metadata") {
++		val removed = IntArray(1)
++		DvVideoRenderer.rewriteSei(nal(mdcv, hdr10Plus), removed).toList() shouldBe nal(mdcv).toList()
++		removed[0] shouldBe 1
++	}
++
++	test("drops the whole NAL when only HDR10+ was in it") {
++		val removed = IntArray(1)
++		DvVideoRenderer.rewriteSei(nal(hdr10Plus), removed) shouldBe null
++		removed[0] shouldBe 1
++	}
++
++	test("leaves a NAL without HDR10+ untouched") {
++		val removed = IntArray(1)
++		val n = nal(mdcv)
++		DvVideoRenderer.rewriteSei(n, removed).toList() shouldBe n.toList()
++		removed[0] shouldBe 0
++	}
++
++	test("rewrites a sample in place and keeps the other NAL units") {
++		val slice = byteArrayOf(0, 0, 0, 1, 0x02, 0x01, 0x55, 0x66)
++		val sample = byteArrayOf(0, 0, 0, 1) + nal(mdcv, hdr10Plus) + byteArrayOf(0, 0, 0, 1) + nal(hdr10Plus) + slice
++		val buffer = ByteBuffer.allocate(sample.size).put(sample).also { it.flip() }
++		DvVideoRenderer.stripHdr10PlusSei(buffer) shouldBe 2
++		val result = ByteArray(buffer.remaining()).also { buffer.get(it) }
++		result.toList() shouldBe (byteArrayOf(0, 0, 0, 1) + nal(mdcv) + slice).toList()
++	}
++})
+-- 
+2.53.0
+

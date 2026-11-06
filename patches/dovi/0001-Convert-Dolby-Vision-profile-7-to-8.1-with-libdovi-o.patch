@@ -1,0 +1,266 @@
+From 3ea84fa3164a608f4a8b2e27ac4d153b0a80dec7 Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 08:34:09 -0700
+Subject: [PATCH 1/2] Convert Dolby Vision profile 7 to 8.1 with libdovi on the
+ DV decoder
+
+Profile 7 (UHD Blu-ray) files only show their HDR10 base layer on the
+Dolby Vision decoder. Configure the decoder as DvheSt, drop the
+enhancement layer (NAL 63) and convert each RPU (NAL 62) to profile 8.1
+with libdovi mode 2, as Kodi does. When a DV track ends up on a plain
+HEVC decoder, strip NAL 62/63 so it plays as HDR10.
+
+libdovi is reached through a small JNI shim (libdoviconv.so).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../androidtv/ui/playback/VideoManager.java   |  29 +++-
+ .../media3/exoplayer/dovi/DoviConv.java       |  28 ++++
+ .../exoplayer/dovi/DvVideoRenderer.java       | 153 ++++++++++++++++++
+ 3 files changed, 209 insertions(+), 1 deletion(-)
+ create mode 100644 playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DoviConv.java
+ create mode 100644 playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
+
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+index 3be5cb2f0..c2ec8c19f 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+@@ -34,6 +34,11 @@ import androidx.media3.datasource.DefaultDataSource;
+ import androidx.media3.datasource.HttpDataSource;
+ import androidx.media3.exoplayer.DefaultLoadControl;
+ import androidx.media3.exoplayer.DefaultRenderersFactory;
++import androidx.media3.exoplayer.Renderer;
++import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
++import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
++import androidx.media3.exoplayer.video.VideoRendererEventListener;
++import org.jellyfin.playback.media3.exoplayer.dovi.DvVideoRenderer;
+ import androidx.media3.exoplayer.ExoPlayer;
+ import androidx.media3.exoplayer.analytics.AnalyticsListener;
+ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+@@ -218,7 +223,29 @@ public class VideoManager {
+      */
+     private ExoPlayer.Builder configureExoplayerBuilder(Context context, AssHandler assHandler) {
+         ExoPlayer.Builder exoPlayerBuilder = new ExoPlayer.Builder(context);
+-        DefaultRenderersFactory defaultRendererFactory = new DefaultRenderersFactory(context);
++        DefaultRenderersFactory defaultRendererFactory = new DefaultRenderersFactory(context) {
++            // Dolby Vision: profile 7 converted to 8.1 with libdovi (as Kodi does); stray RPU/EL stripped for plain HEVC.
++            @Override
++            protected void buildVideoRenderers(Context ctx, int extensionRendererMode, MediaCodecSelector mediaCodecSelector,
++                    boolean enableDecoderFallback, Handler eventHandler, VideoRendererEventListener eventListener,
++                    long allowedVideoJoiningTimeMs, ArrayList<Renderer> out) {
++                int first = out.size();
++                super.buildVideoRenderers(ctx, extensionRendererMode, mediaCodecSelector, enableDecoderFallback, eventHandler,
++                        eventListener, allowedVideoJoiningTimeMs, out);
++                for (int i = first; i < out.size(); i++) {
++                    if (out.get(i) instanceof MediaCodecVideoRenderer) {
++                        out.set(i, new DvVideoRenderer(new MediaCodecVideoRenderer.Builder(ctx)
++                                .setMediaCodecSelector(mediaCodecSelector)
++                                .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
++                                .setEnableDecoderFallback(enableDecoderFallback)
++                                .setEventHandler(eventHandler)
++                                .setEventListener(eventListener)
++                                .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)));
++                        break;
++                    }
++                }
++            }
++        };
+         defaultRendererFactory.setEnableDecoderFallback(true);
+         defaultRendererFactory.setExtensionRendererMode(determineExoPlayerExtensionRendererMode());
+ 
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DoviConv.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DoviConv.java
+new file mode 100644
+index 000000000..6782cf635
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DoviConv.java
+@@ -0,0 +1,28 @@
++package org.jellyfin.playback.media3.exoplayer.dovi;
++
++import androidx.annotation.Nullable;
++
++import timber.log.Timber;
++
++/** libdovi (via libdoviconv.so): Dolby Vision profile 7 RPU -> profile 8.1 (mode 2), as Kodi does. */
++public final class DoviConv {
++	static final boolean AVAILABLE;
++
++	static {
++		boolean ok;
++		try {
++			System.loadLibrary("doviconv");
++			ok = true;
++		} catch (UnsatisfiedLinkError e) {
++			Timber.w(e, "libdoviconv not loaded");
++			ok = false;
++		}
++		AVAILABLE = ok;
++	}
++
++	/** {@code nal} = RPU NAL from its 2-byte header (no start code). Null if not P7 or conversion failed. */
++	@Nullable
++	static native byte[] convertP7(byte[] nal);
++
++	private DoviConv() {}
++}
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
+new file mode 100644
+index 000000000..9be26e91b
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/DvVideoRenderer.java
+@@ -0,0 +1,153 @@
++package org.jellyfin.playback.media3.exoplayer.dovi;
++
++import android.media.MediaCodecInfo;
++import android.media.MediaFormat;
++import androidx.annotation.Nullable;
++import androidx.annotation.OptIn;
++import androidx.media3.common.Format;
++import androidx.media3.common.MimeTypes;
++import androidx.media3.common.util.UnstableApi;
++import androidx.media3.decoder.DecoderInputBuffer;
++import androidx.media3.exoplayer.ExoPlaybackException;
++import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
++import java.nio.ByteBuffer;
++
++import timber.log.Timber;
++
++/**
++ * MediaCodecVideoRenderer that, when a Dolby Vision track ends up on a plain HEVC decoder (e.g. profile 7,
++ * which the DV decoder rejects), strips the RPU (NAL 62) and enhancement layer (NAL 63) so the decoder sees
++ * a clean HDR10 base layer.
++ */
++@OptIn(markerClass = UnstableApi.class)
++public final class DvVideoRenderer extends MediaCodecVideoRenderer {
++	/** MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheSt, which is API 27+ as a named constant. */
++	private static final int DOLBY_VISION_PROFILE_DVHE_ST = 0x100;
++
++	private long stripped;
++	private int samples;
++	private long converted, failed;
++	/** Convert profile 7 (FEL/MEL) to 8.1 with libdovi; otherwise the DV decoder shows only the HDR10 base layer. */
++	static boolean convertP7 = true;
++
++	public DvVideoRenderer(Builder builder) {
++		super(builder);
++	}
++
++	private static boolean isP7(@Nullable Format f) {
++		return f != null && MimeTypes.VIDEO_DOLBY_VISION.equals(f.sampleMimeType) && f.codecs != null && f.codecs.startsWith("dvhe.07");
++	}
++
++	/** Profile 7 on the DV decoder: tell it profile 8 (the RPUs are converted on the way in), like Kodi. */
++	@Override
++	protected MediaFormat getMediaFormat(Format format, String codecMimeType, CodecMaxValues codecMaxValues, float codecOperatingRate,
++			boolean deviceNeedsNoPostProcessWorkaround, int tunnelingAudioSessionId) {
++		MediaFormat mf = super.getMediaFormat(format, codecMimeType, codecMaxValues, codecOperatingRate, deviceNeedsNoPostProcessWorkaround,
++				tunnelingAudioSessionId);
++		if (convertP7 && DoviConv.AVAILABLE && isP7(format) && MimeTypes.VIDEO_DOLBY_VISION.equals(codecMimeType)) {
++			mf.setInteger(MediaFormat.KEY_PROFILE, DOLBY_VISION_PROFILE_DVHE_ST);
++			Timber.i("P7 -> P8.1: DV decoder configured as DvheSt");
++		}
++		return mf;
++	}
++
++	@Override
++	protected void onQueueInputBuffer(DecoderInputBuffer buffer) throws ExoPlaybackException {
++		super.onQueueInputBuffer(buffer);
++		androidx.media3.exoplayer.mediacodec.MediaCodecInfo info = getCodecInfo();
++		Format in = getCodecInputFormat();
++		if (info == null || in == null || buffer.data == null) return;
++		if (convertP7 && DoviConv.AVAILABLE && isP7(in) && MimeTypes.VIDEO_DOLBY_VISION.equals(info.mimeType)) {
++			int[] stats = convertP7Sample(buffer.data);
++			converted += stats[0];
++			failed += stats[1];
++			if (samples++ % 500 == 0) Timber.i("P7 -> P8.1 on %s: %d RPUs converted, %d failed, %d samples", info.name, converted, failed, samples);
++			return;
++		}
++		if (!MimeTypes.VIDEO_H265.equals(info.mimeType) || !MimeTypes.VIDEO_DOLBY_VISION.equals(in.sampleMimeType)) return;
++		int removed = stripDvNals(buffer.data);
++		stripped += removed;
++		if (samples++ % 500 == 0) Timber.i("DV on %s: stripped NAL 62/63, %d bytes over %d samples", info.name, stripped, samples);
++	}
++
++	/** Drops EL NALs (63) and replaces RPU NALs (62) with libdovi's P8.1 conversion; returns {converted, failed}. */
++	static int[] convertP7Sample(ByteBuffer b) {
++		int start = b.position(), end = b.limit();
++		byte[] src = new byte[end - start];
++		b.duplicate().get(src);
++		java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(src.length);
++		int conv = 0, fail = 0;
++		int i = 0, nalStart = -1, scStart = -1;
++		java.util.ArrayList<int[]> nals = new java.util.ArrayList<>(); // {startCodeStart, payloadStart}
++		while (i + 3 <= src.length) {
++			if (src[i] == 0 && src[i + 1] == 0 && src[i + 2] == 1) {
++				int sc = (i > 0 && src[i - 1] == 0) ? i - 1 : i;
++				nals.add(new int[] {sc, i + 3});
++				i += 3;
++			} else {
++				i++;
++			}
++		}
++		if (nals.isEmpty()) return new int[] {0, 0};
++		for (int k = 0; k < nals.size(); k++) {
++			int sc = nals.get(k)[0], p = nals.get(k)[1];
++			int e = k + 1 < nals.size() ? nals.get(k + 1)[0] : src.length;
++			int type = p < e ? (src[p] >> 1) & 0x3f : -1;
++			if (type == 63) continue;
++			if (type == 62) {
++				byte[] nal = java.util.Arrays.copyOfRange(src, p, e);
++				byte[] c = DoviConv.convertP7(nal);
++				out.write(0); out.write(0); out.write(0); out.write(1);
++				if (c != null) {
++					out.write(c, 0, c.length);
++					conv++;
++				} else {
++					out.write(nal, 0, nal.length);
++					fail++;
++				}
++				continue;
++			}
++			out.write(src, sc, e - sc);
++		}
++		byte[] o = out.toByteArray();
++		if (o.length > b.capacity() - start) return new int[] {0, fail + 1}; // cannot happen in practice (output shrinks)
++		b.limit(b.capacity());
++		b.position(start);
++		b.put(o);
++		b.limit(start + o.length);
++		b.position(start);
++		return new int[] {conv, fail};
++	}
++
++	/** Removes Annex-B NAL units of type 62/63 in place (position..limit); returns bytes removed. */
++	static int stripDvNals(ByteBuffer b) {
++		int start = b.position(), end = b.limit();
++		int[] nals = new int[256];
++		int n = 0;
++		for (int i = start; i + 3 <= end && n < nals.length - 1; i++) {
++			if (b.get(i) == 0 && b.get(i + 1) == 0 && b.get(i + 2) == 1) {
++				int sc = (i > start && b.get(i - 1) == 0) ? i - 1 : i; // 4-byte start code
++				nals[n++] = sc;
++				i += 2;
++			}
++		}
++		if (n == 0) return 0;
++		nals[n] = end;
++		int w = nals[0], removed = 0;
++		for (int k = 0; k < n; k++) {
++			int s = nals[k], e = nals[k + 1];
++			int hdr = s;
++			while (b.get(hdr) == 0) hdr++;
++			hdr++; // past the 0x01
++			int type = hdr < e ? (b.get(hdr) >> 1) & 0x3f : -1;
++			if (type == 62 || type == 63) {
++				removed += e - s;
++				continue;
++			}
++			if (w != s) for (int j = s; j < e; j++) b.put(w + (j - s), b.get(j));
++			w += e - s;
++		}
++		b.limit(w);
++		return removed;
++	}
++}
+-- 
+2.53.0
+

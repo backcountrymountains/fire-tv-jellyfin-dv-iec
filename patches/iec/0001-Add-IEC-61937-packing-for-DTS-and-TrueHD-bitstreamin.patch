@@ -1,0 +1,1683 @@
+From c97072e1cca2aa3b24087a7e5709d5cc8cb53e56 Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 08:35:00 -0700
+Subject: [PATCH] Add IEC 61937 packing for DTS and TrueHD bitstreaming
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../jellyfin/androidtv/di/PlaybackModule.kt   |   1 +
+ .../androidtv/preference/UserPreferences.kt   |   5 +
+ .../androidtv/ui/playback/VideoManager.java   |   5 +-
+ .../SettingsPlaybackAdvancedScreen.kt         |  11 +
+ .../androidtv/util/profile/deviceProfile.kt   |   4 +-
+ app/src/main/res/values/strings.xml           |   2 +
+ .../src/main/kotlin/ExoPlayerBackend.kt       |   6 +-
+ .../src/main/kotlin/ExoPlayerOptions.kt       |   1 +
+ .../src/main/kotlin/audio/IecAudioOutput.kt   | 196 ++++++++++
+ .../kotlin/audio/IecAudioOutputProvider.kt    | 176 +++++++++
+ .../src/main/kotlin/audio/IecPacker.kt        | 368 ++++++++++++++++++
+ .../main/kotlin/audio/IecRenderersFactory.kt  |  25 ++
+ .../src/test/kotlin/audio/IecPackerTests.kt   |  87 +++++
+ .../kotlin/audio/IecPositionSmootherTests.kt  |  49 +++
+ .../src/test/resources/iec/dts-core.dts       | Bin 0 -> 19456 bytes
+ .../src/test/resources/iec/truehd.thd         | Bin 0 -> 27968 bytes
+ 16 files changed, 933 insertions(+), 3 deletions(-)
+ create mode 100644 playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutput.kt
+ create mode 100644 playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutputProvider.kt
+ create mode 100644 playback/media3/exoplayer/src/main/kotlin/audio/IecPacker.kt
+ create mode 100644 playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
+ create mode 100644 playback/media3/exoplayer/src/test/kotlin/audio/IecPackerTests.kt
+ create mode 100644 playback/media3/exoplayer/src/test/kotlin/audio/IecPositionSmootherTests.kt
+ create mode 100644 playback/media3/exoplayer/src/test/resources/iec/dts-core.dts
+ create mode 100644 playback/media3/exoplayer/src/test/resources/iec/truehd.thd
+
+diff --git a/app/src/main/java/org/jellyfin/androidtv/di/PlaybackModule.kt b/app/src/main/java/org/jellyfin/androidtv/di/PlaybackModule.kt
+index f61ca4d9f..3430c7a70 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/di/PlaybackModule.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/di/PlaybackModule.kt
+@@ -75,6 +75,7 @@ fun Scope.createPlaybackManager() = playbackManager(androidContext()) {
+ 	val exoPlayerOptions = ExoPlayerOptions(
+ 		preferFfmpeg = userPreferences[UserPreferences.preferExoPlayerFfmpeg],
+ 		enableLibass = userPreferences[UserPreferences.assDirectPlay],
++		enableIecPacking = userPreferences[UserPreferences.audioIecPacking],
+ 		enableDebugLogging = userPreferences[UserPreferences.debuggingEnabled],
+ 		baseDataSourceFactory = get<HttpDataSource.Factory>(),
+ 		minBufferDuration = bufferLength.minBufferDuration,
+diff --git a/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt b/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
+index 4ef6bd124..81b230425 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/preference/UserPreferences.kt
+@@ -134,6 +134,11 @@ class UserPreferences(context: Context) : SharedPreferenceStore(
+ 		 */
+ 		var audioNightMode = enumPreference("audio_night_mode", false)
+ 
++		/**
++		 * Whether DTS and TrueHD are packed into IEC 61937 by the app instead of the platform when bitstreaming.
++		 */
++		var audioIecPacking = booleanPreference("audio_iec_packing", defaultValue = false)
++
+ 		/**
+ 		 * AC3 bitstream device profile override.
+ 		 */
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+index 3be5cb2f0..74e9ceeb1 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+@@ -51,6 +51,7 @@ import org.jellyfin.androidtv.data.compat.StreamInfo;
+ import org.jellyfin.androidtv.preference.UserPreferences;
+ import org.jellyfin.androidtv.preference.constant.BufferLength;
+ import org.jellyfin.androidtv.preference.constant.ZoomMode;
++import org.jellyfin.playback.media3.exoplayer.audio.IecRenderersFactory;
+ import org.jellyfin.sdk.api.client.ApiClient;
+ import org.jellyfin.sdk.model.api.MediaStream;
+ import org.jellyfin.sdk.model.api.MediaStreamType;
+@@ -218,7 +219,9 @@ public class VideoManager {
+      */
+     private ExoPlayer.Builder configureExoplayerBuilder(Context context, AssHandler assHandler) {
+         ExoPlayer.Builder exoPlayerBuilder = new ExoPlayer.Builder(context);
+-        DefaultRenderersFactory defaultRendererFactory = new DefaultRenderersFactory(context);
++        DefaultRenderersFactory defaultRendererFactory = userPreferences.get(UserPreferences.Companion.getAudioIecPacking())
++                ? new IecRenderersFactory(context)
++                : new DefaultRenderersFactory(context);
+         defaultRendererFactory.setEnableDecoderFallback(true);
+         defaultRendererFactory.setExtensionRendererMode(determineExoPlayerExtensionRendererMode());
+ 
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackAdvancedScreen.kt b/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackAdvancedScreen.kt
+index 9fc0e35bc..a91a6a014 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackAdvancedScreen.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/settings/screen/playback/SettingsPlaybackAdvancedScreen.kt
+@@ -288,6 +288,17 @@ fun SettingsPlaybackAdvancedScreen() {
+ 			)
+ 		}
+ 
++		item {
++			var audioIecPacking by rememberPreference(userPreferences, UserPreferences.audioIecPacking)
++			ListButton(
++				headingContent = { Text(stringResource(R.string.audio_iec_packing)) },
++				trailingContent = { Checkbox(checked = audioIecPacking) },
++				captionContent = { Text(stringResource(R.string.audio_iec_packing_content)) },
++				onClick = { audioIecPacking = !audioIecPacking },
++				modifier = Modifier.focusKey("audio_iec_packing")
++			)
++		}
++
+ 		item {
+ 			var preferExoPlayerFfmpeg by rememberPreference(userPreferences, UserPreferences.preferExoPlayerFfmpeg)
+ 			ListButton(
+diff --git a/app/src/main/java/org/jellyfin/androidtv/util/profile/deviceProfile.kt b/app/src/main/java/org/jellyfin/androidtv/util/profile/deviceProfile.kt
+index 4588e48c7..b72b2e670 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/util/profile/deviceProfile.kt
++++ b/app/src/main/java/org/jellyfin/androidtv/util/profile/deviceProfile.kt
+@@ -10,6 +10,7 @@ import org.jellyfin.androidtv.preference.constant.BitstreamAudioMode
+ import org.jellyfin.androidtv.preference.constant.HdrFormat
+ import org.jellyfin.androidtv.preference.constant.HdrOverrideMode
+ import org.jellyfin.androidtv.util.profile.codec.isPassthroughAudioAvailable
++import org.jellyfin.playback.media3.exoplayer.audio.IecAudioOutputProvider
+ import org.jellyfin.sdk.model.ServerVersion
+ import org.jellyfin.sdk.model.api.CodecType
+ import org.jellyfin.sdk.model.api.DlnaProfileType
+@@ -85,7 +86,8 @@ private fun UserPreferences.getHdrRangeTypesFor(mode: HdrOverrideMode): Set<Vide
+ 
+ private fun UserPreferences.isBitstreamAudioEnabled(context: Context, format: BitstreamAudioFormat): Boolean =
+ 	when (this[format.preference]) {
+-		BitstreamAudioMode.AUTO -> isPassthroughAudioAvailable(context, format.mimeType)
++		BitstreamAudioMode.AUTO -> isPassthroughAudioAvailable(context, format.mimeType) ||
++			(this[UserPreferences.audioIecPacking] && format.mimeType in IecAudioOutputProvider.MIME_TYPES)
+ 		BitstreamAudioMode.ENABLE -> true
+ 		BitstreamAudioMode.DISABLE -> false
+ 	}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 123b301c2..c8608e2b6 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -554,6 +554,8 @@
+     <string name="past_24_hours">Past 24 hours</string>
+     <string name="prefer_exoplayer_ffmpeg">Prefer FFmpeg for audio playback</string>
+     <string name="prefer_exoplayer_ffmpeg_content">Use FFmpeg to decode audio, even if platform codecs are available.</string>
++    <string name="audio_iec_packing">Pack DTS and TrueHD for bitstreaming</string>
++    <string name="audio_iec_packing_content">Send DTS, DTS-HD and TrueHD to the receiver unchanged on devices that convert or mute them. Volume and playback speed cannot be changed for these formats.</string>
+     <string name="default_video_zoom">Default zoom mode</string>
+     <string name="video_start_delay">Video start delay</string>
+     <string name="playback_buffer_length">Playback buffer size</string>
+diff --git a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
+index 1f84095ab..4b74dde4e 100644
+--- a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
++++ b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
+@@ -44,6 +44,7 @@ import org.jellyfin.playback.core.support.PlaySupportReport
+ import org.jellyfin.playback.core.timedevent.TimedEvent
+ import org.jellyfin.playback.core.ui.PlayerSubtitleView
+ import org.jellyfin.playback.core.ui.PlayerSurfaceView
++import org.jellyfin.playback.media3.exoplayer.audio.IecRenderersFactory
+ import org.jellyfin.playback.media3.exoplayer.support.getPlaySupportReport
+ import org.jellyfin.playback.media3.exoplayer.support.toFormats
+ import timber.log.Timber
+@@ -97,7 +98,10 @@ class ExoPlayerBackend(
+ 			}
+ 		} else DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
+ 
+-		val renderersFactory = DefaultRenderersFactory(context).apply {
++		val renderersFactory = when (exoPlayerOptions.enableIecPacking) {
++			true -> IecRenderersFactory(context)
++			false -> DefaultRenderersFactory(context)
++		}.apply {
+ 			setEnableDecoderFallback(true)
+ 			setExtensionRendererMode(
+ 				when (exoPlayerOptions.preferFfmpeg) {
+diff --git a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerOptions.kt b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerOptions.kt
+index 27b351c40..705198336 100644
+--- a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerOptions.kt
++++ b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerOptions.kt
+@@ -8,6 +8,7 @@ data class ExoPlayerOptions(
+ 	val preferFfmpeg: Boolean = false,
+ 	val enableDebugLogging: Boolean = false,
+ 	val enableLibass: Boolean = false,
++	val enableIecPacking: Boolean = false,
+ 	val baseDataSourceFactory: DataSource.Factory = DefaultHttpDataSource.Factory(),
+ 	val minBufferDuration: Duration? = null,
+ 	val maxBufferDuration: Duration? = null,
+diff --git a/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutput.kt b/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutput.kt
+new file mode 100644
+index 000000000..b7303c725
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutput.kt
+@@ -0,0 +1,196 @@
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import android.media.AudioDeviceInfo
++import android.media.AudioTimestamp
++import android.media.AudioTrack
++import android.os.Build
++import androidx.annotation.OptIn
++import androidx.annotation.RequiresApi
++import androidx.media3.common.PlaybackParameters
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.audio.AudioOutput
++import java.nio.ByteBuffer
++import java.util.concurrent.CopyOnWriteArraySet
++
++/**
++ * [AudioOutput] that packs DTS and TrueHD into IEC 61937 bursts and writes them to an `ENCODING_IEC61937` [AudioTrack].
++ * The track runs at the 192 kHz carrier rate, so one carrier frame is 1/192000 s of content.
++ *
++ * On [release] the track is handed to [onRelease] instead of being released, so the next output can keep using it.
++ */
++@OptIn(UnstableApi::class)
++@RequiresApi(Build.VERSION_CODES.N)
++@Suppress("TooManyFunctions") // Required by AudioOutput
++internal class IecAudioOutput(
++	private val audioTrack: AudioTrack,
++	private val packer: IecPacker,
++	private val contentSampleRate: Int,
++	private val onRelease: (AudioTrack) -> Unit,
++) : AudioOutput {
++	private val listeners = CopyOnWriteArraySet<AudioOutput.Listener>()
++	private val pendingBursts = ArrayDeque<ByteBuffer>()
++	private val timestamp = AudioTimestamp()
++	private val positionSmoother = IecPositionSmoother()
++	private val createdNanos = System.nanoTime()
++	private var writtenBytes = 0L
++	private var playing = false
++	private var positionAdvancing = false
++	private var lastTimestampFrames = -1L
++	private var lastTimestampNanos = 0L
++	private var underrunCount = 0
++
++	override fun play() {
++		playing = true
++		audioTrack.play()
++	}
++
++	override fun pause() {
++		playing = false
++		positionSmoother.reset()
++		audioTrack.pause()
++	}
++
++	override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
++		if (pendingBursts.isEmpty() && buffer.hasRemaining()) packer.pack(buffer, pendingBursts)
++
++		while (pendingBursts.isNotEmpty()) {
++			val burst = pendingBursts.first()
++			val size = burst.remaining()
++			val written = audioTrack.write(burst, size, AudioTrack.WRITE_NON_BLOCKING)
++			if (written < 0) throw AudioOutput.WriteException(written, false)
++			writtenBytes += written
++			if (written < size) return false
++			packer.recycle(pendingBursts.removeFirst())
++		}
++
++		buffer.position(buffer.limit())
++		return true
++	}
++
++	override fun flush() {
++		pendingBursts.clear()
++		packer.reset()
++		audioTrack.pause()
++		audioTrack.flush()
++		writtenBytes = 0
++		lastTimestampFrames = -1
++		positionAdvancing = false
++		positionSmoother.reset()
++		if (playing) audioTrack.play()
++	}
++
++	override fun stop() = audioTrack.stop()
++
++	override fun release() {
++		if (audioTrack.state == AudioTrack.STATE_INITIALIZED) {
++			audioTrack.pause()
++			audioTrack.flush()
++			onRelease(audioTrack)
++		} else {
++			audioTrack.release()
++		}
++		listeners.forEach { it.onReleased() }
++	}
++
++	override fun getPositionUs(): Long {
++		val writtenFrames = writtenBytes / IecPacker.CARRIER_FRAME_BYTES
++		var frames = audioTrack.playbackHeadPosition.toUInt().toLong()
++		if (playing && readTimestamp()) {
++			if (timestamp.framePosition != lastTimestampFrames) {
++				lastTimestampFrames = timestamp.framePosition
++				lastTimestampNanos = timestamp.nanoTime
++			}
++			frames = lastTimestampFrames + (System.nanoTime() - lastTimestampNanos) * IecPacker.CARRIER_SAMPLE_RATE / NANOS_PER_SECOND
++		}
++		val rawPositionUs = minOf(frames, writtenFrames) * MICROS_PER_SECOND / IecPacker.CARRIER_SAMPLE_RATE
++
++		if (!positionAdvancing && rawPositionUs > 0) {
++			positionAdvancing = true
++			val playoutStartMs = System.currentTimeMillis() - rawPositionUs / MICROS_PER_MILLI
++			listeners.forEach { it.onPositionAdvancing(playoutStartMs) }
++		}
++
++		val underruns = audioTrack.underrunCount
++		if (underruns > underrunCount) listeners.forEach { it.onUnderrun() }
++		underrunCount = underruns
++
++		return if (playing) positionSmoother.smooth(rawPositionUs, System.nanoTime()) else rawPositionUs
++	}
++
++	// A reused track can still report the previous output's timestamp, so only use newer ones
++	private fun readTimestamp() = audioTrack.getTimestamp(timestamp) && timestamp.framePosition > 0 && timestamp.nanoTime > createdNanos
++
++	// Bitstream output cannot change volume or speed
++	override fun setVolume(volume: Float) = Unit
++	override fun getPlaybackParameters(): PlaybackParameters = PlaybackParameters.DEFAULT
++	override fun setPlaybackParameters(playbackParams: PlaybackParameters) = Unit
++
++	override fun isOffloadedPlayback() = false
++	override fun getAudioSessionId() = audioTrack.audioSessionId
++	override fun getSampleRate() = contentSampleRate
++	override fun getBufferSizeInFrames() = audioTrack.bufferSizeInFrames.toLong()
++	override fun isStalled() = false
++	override fun addListener(listener: AudioOutput.Listener) {
++		listeners.add(listener)
++	}
++
++	override fun removeListener(listener: AudioOutput.Listener) {
++		listeners.remove(listener)
++	}
++
++	override fun setOffloadDelayPadding(delayInFrames: Int, paddingInFrames: Int) = Unit
++	override fun setOffloadEndOfStream() = Unit
++	override fun attachAuxEffect(effectId: Int) = Unit
++	override fun setAuxEffectSendLevel(level: Float) = Unit
++	override fun setPreferredDevice(preferredDevice: AudioDeviceInfo?) {
++		audioTrack.setPreferredDevice(preferredDevice)
++	}
++
++	private companion object {
++		const val NANOS_PER_SECOND = 1_000_000_000L
++		const val MICROS_PER_SECOND = 1_000_000L
++		const val MICROS_PER_MILLI = 1_000L
++	}
++}
++
++/**
++ * Smooths the position of an IEC track. Its timestamps occasionally jump by tens of milliseconds and back, which shows
++ * as a skip when followed directly. The position is extrapolated on the system clock and slewed towards the track's
++ * position by at most 2 % of the elapsed time; large errors and the first second are followed directly.
++ */
++internal class IecPositionSmoother {
++	private var lastPositionUs = -1L
++	private var lastNanos = 0L
++
++	fun reset() {
++		lastPositionUs = -1
++	}
++
++	fun smooth(rawPositionUs: Long, nowNanos: Long): Long {
++		var positionUs = rawPositionUs
++		if (lastPositionUs >= 0 && rawPositionUs > 0) {
++			val elapsedUs = (nowNanos - lastNanos) / NANOS_PER_MICRO
++			val predictedUs = lastPositionUs + elapsedUs
++			val errorUs = rawPositionUs - predictedUs
++			positionUs = if (rawPositionUs < FOLLOW_RAW_UNTIL_US || errorUs !in -RESYNC_THRESHOLD_US..RESYNC_THRESHOLD_US) {
++				rawPositionUs
++			} else {
++				val maxStepUs = elapsedUs / MAX_SLEW_DIVISOR + MIN_STEP_US
++				predictedUs + errorUs.coerceIn(-maxStepUs, maxStepUs)
++			}
++			// Never move backwards while playing
++			positionUs = maxOf(positionUs, lastPositionUs)
++		}
++		lastPositionUs = positionUs
++		lastNanos = nowNanos
++		return positionUs
++	}
++
++	private companion object {
++		const val NANOS_PER_MICRO = 1_000L
++		const val FOLLOW_RAW_UNTIL_US = 1_000_000L
++		const val RESYNC_THRESHOLD_US = 100_000L
++		const val MAX_SLEW_DIVISOR = 50
++		const val MIN_STEP_US = 200L
++	}
++}
+diff --git a/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutputProvider.kt b/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutputProvider.kt
+new file mode 100644
+index 000000000..a99ca1e55
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/kotlin/audio/IecAudioOutputProvider.kt
+@@ -0,0 +1,176 @@
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioManager
++import android.media.AudioTrack
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import androidx.annotation.OptIn
++import androidx.annotation.RequiresApi
++import androidx.media3.common.C
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.audio.AudioOutput
++import androidx.media3.exoplayer.audio.AudioOutputProvider
++import androidx.media3.exoplayer.audio.ForwardingAudioOutputProvider
++import androidx.media3.extractor.Ac3Util
++import androidx.media3.extractor.DtsUtil
++import timber.log.Timber
++
++/**
++ * Plays DTS, DTS-HD and TrueHD as IEC 61937 bursts packed by the app ([IecAudioOutput]) and forwards everything else
++ * to [delegate]. This sends the lossless formats to the receiver unchanged on devices whose audio HAL does not pass
++ * them through itself.
++ *
++ * Media3 releases the audio output on every flush (see `DefaultAudioSink.flush`), and a new IEC track makes the
++ * receiver lock onto the stream again, which mutes the first second after every seek. The provider therefore keeps a
++ * released track for a few seconds and hands it to the next output.
++ */
++@OptIn(UnstableApi::class)
++class IecAudioOutputProvider(delegate: AudioOutputProvider) : ForwardingAudioOutputProvider(delegate) {
++	private val handler = Handler(Looper.getMainLooper())
++	private val releaseParkedTrackRunnable = Runnable { releaseParkedTrack() }
++	private var parkedTrack: AudioTrack? = null
++	private var parkedTrackIsTrueHd = false
++
++	override fun getFormatSupport(formatConfig: AudioOutputProvider.FormatConfig): AudioOutputProvider.FormatSupport {
++		if (!isIecFormat(formatConfig)) return super.getFormatSupport(formatConfig)
++
++		return AudioOutputProvider.FormatSupport.Builder()
++			.setFormatSupportLevel(AudioOutputProvider.FORMAT_SUPPORTED_DIRECTLY)
++			.build()
++	}
++
++	override fun getOutputConfig(formatConfig: AudioOutputProvider.FormatConfig): AudioOutputProvider.OutputConfig {
++		if (!isIecFormat(formatConfig)) return super.getOutputConfig(formatConfig)
++
++		val format = formatConfig.format
++		val trueHd = format.sampleMimeType == MimeTypes.AUDIO_TRUEHD
++		val maxBytesPerSecond = if (trueHd) Ac3Util.TRUEHD_MAX_RATE_BYTES_PER_SECOND else DtsUtil.DTS_HD_MAX_RATE_BYTES_PER_SECOND
++		return AudioOutputProvider.OutputConfig.Builder()
++			.setEncoding(if (trueHd) C.ENCODING_DOLBY_TRUEHD else C.ENCODING_DTS_HD)
++			.setSampleRate(format.sampleRate)
++			.setChannelMask(CHANNEL_MASK)
++			// Only used by the sink to estimate the buffered duration
++			.setBufferSize(maxBytesPerSecond / BUFFER_SIZE_DIVISOR)
++			.setAudioAttributes(formatConfig.audioAttributes)
++			.setAudioSessionId(formatConfig.audioSessionId)
++			.setVirtualDeviceId(formatConfig.virtualDeviceId)
++			.build()
++	}
++
++	override fun getAudioOutput(config: AudioOutputProvider.OutputConfig): AudioOutput {
++		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || !isIecOutput(config)) {
++			releaseParkedTrack()
++			return super.getAudioOutput(config)
++		}
++
++		val trueHd = config.encoding == C.ENCODING_DOLBY_TRUEHD
++
++		val audioTrack = takeParkedTrack(trueHd, config.audioSessionId) ?: createAudioTrack(config)
++		return IecAudioOutput(
++			audioTrack = audioTrack,
++			packer = IecPacker.forTrueHd(trueHd),
++			contentSampleRate = config.sampleRate,
++			onRelease = { track -> parkTrack(track, trueHd) },
++		)
++	}
++
++	override fun release() {
++		releaseParkedTrack()
++		super.release()
++	}
++
++	private fun isIecFormat(formatConfig: AudioOutputProvider.FormatConfig) =
++		Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
++			!formatConfig.enableTunneling &&
++			formatConfig.format.sampleMimeType in MIME_TYPES
++
++	private fun isIecOutput(config: AudioOutputProvider.OutputConfig) = !config.isTunneling && config.encoding in IEC_ENCODINGS
++
++	@RequiresApi(Build.VERSION_CODES.N)
++	@Suppress("ThrowsCount")
++	private fun createAudioTrack(config: AudioOutputProvider.OutputConfig): AudioTrack {
++		val format = AudioFormat.Builder()
++			.setEncoding(AudioFormat.ENCODING_IEC61937)
++			.setSampleRate(IecPacker.CARRIER_SAMPLE_RATE)
++			.setChannelMask(CHANNEL_MASK)
++			.build()
++		val minBufferSize = AudioTrack.getMinBufferSize(IecPacker.CARRIER_SAMPLE_RATE, CHANNEL_MASK, AudioFormat.ENCODING_IEC61937)
++		val sessionId = when (config.audioSessionId) {
++			C.AUDIO_SESSION_ID_UNSET -> AudioManager.AUDIO_SESSION_ID_GENERATE
++			else -> config.audioSessionId
++		}
++
++		val audioTrack = try {
++			AudioTrack.Builder()
++				.setAudioAttributes(config.audioAttributes.getPlatformAudioAttributes())
++				.setAudioFormat(format)
++				.setBufferSizeInBytes(maxOf(minBufferSize * 2, MIN_BUFFER_SIZE))
++				.setTransferMode(AudioTrack.MODE_STREAM)
++				.setSessionId(sessionId)
++				.build()
++		} catch (err: UnsupportedOperationException) {
++			throw AudioOutputProvider.InitializationException(err)
++		} catch (err: IllegalArgumentException) {
++			throw AudioOutputProvider.InitializationException(err)
++		}
++
++		if (audioTrack.state != AudioTrack.STATE_INITIALIZED) {
++			audioTrack.release()
++			throw AudioOutputProvider.InitializationException(IllegalStateException("IEC 61937 AudioTrack not initialized"))
++		}
++
++		Timber.i("Created IEC 61937 audio track for ${if (config.encoding == C.ENCODING_DOLBY_TRUEHD) "TrueHD" else "DTS"}")
++		return audioTrack
++	}
++
++	@Synchronized
++	private fun parkTrack(audioTrack: AudioTrack, trueHd: Boolean) {
++		releaseParkedTrack()
++		parkedTrack = audioTrack
++		parkedTrackIsTrueHd = trueHd
++		handler.postDelayed(releaseParkedTrackRunnable, PARKED_TRACK_TIMEOUT_MS)
++	}
++
++	@Synchronized
++	private fun takeParkedTrack(trueHd: Boolean, audioSessionId: Int): AudioTrack? {
++		val audioTrack = parkedTrack ?: return null
++		val sessionMatches = audioSessionId == C.AUDIO_SESSION_ID_UNSET || audioSessionId == audioTrack.audioSessionId
++		if (parkedTrackIsTrueHd != trueHd || !sessionMatches) {
++			releaseParkedTrack()
++			return null
++		}
++
++		handler.removeCallbacks(releaseParkedTrackRunnable)
++		parkedTrack = null
++		Timber.i("Reusing parked IEC 61937 audio track")
++		return audioTrack
++	}
++
++	@Synchronized
++	private fun releaseParkedTrack() {
++		handler.removeCallbacks(releaseParkedTrackRunnable)
++		parkedTrack?.let {
++			Timber.i("Releasing parked IEC 61937 audio track")
++			it.release()
++		}
++		parkedTrack = null
++	}
++
++	companion object {
++		/** The formats this provider packs itself. */
++		val MIME_TYPES = setOf(MimeTypes.AUDIO_DTS, MimeTypes.AUDIO_DTS_HD, MimeTypes.AUDIO_TRUEHD)
++
++		private const val CHANNEL_MASK = AudioFormat.CHANNEL_OUT_7POINT1_SURROUND
++		private const val BUFFER_SIZE_DIVISOR = 4
++		private const val PARKED_TRACK_TIMEOUT_MS = 3_000L
++
++		// Room for 8 MAT bursts (160 ms)
++		private const val MIN_BUFFER_SIZE = 61_440 * 8
++
++		private val IEC_ENCODINGS = setOf(C.ENCODING_DOLBY_TRUEHD, C.ENCODING_DTS_HD)
++	}
++}
+diff --git a/playback/media3/exoplayer/src/main/kotlin/audio/IecPacker.kt b/playback/media3/exoplayer/src/main/kotlin/audio/IecPacker.kt
+new file mode 100644
+index 000000000..450b41d64
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/kotlin/audio/IecPacker.kt
+@@ -0,0 +1,368 @@
++/*
++ * The DTS type IV and TrueHD MAT packing is derived from FFmpeg's libavformat/spdifenc.c:
++ * Copyright (c) 2009 Bartlomiej Wolowiec
++ * Copyright (c) 2010, 2020 Anssi Hannula
++ * Copyright (c) 2010 Carl Eugen Hoyos
++ * Licensed under the GNU Lesser General Public License version 2.1 or later.
++ */
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import timber.log.Timber
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/**
++ * Packs compressed audio into IEC 61937 bursts for an AudioTrack opened with `ENCODING_IEC61937` at 192 kHz with 8
++ * channels. Bursts are little-endian 16-bit words, which is what the platform expects for that encoding.
++ */
++internal sealed class IecPacker {
++	private val freeBursts = ArrayDeque<ByteBuffer>()
++
++	/**
++	 * Packs the access units in [input] (position to limit, the buffer is not consumed) and appends the bursts that
++	 * are complete to [output].
++	 */
++	abstract fun pack(input: ByteBuffer, output: MutableCollection<ByteBuffer>)
++
++	/** Drops all partially packed data, for use after a seek. */
++	abstract fun reset()
++
++	/** Hands a fully written burst back so its memory can be reused. */
++	fun recycle(burst: ByteBuffer) {
++		if (freeBursts.size < MAX_FREE_BURSTS) freeBursts.addLast(burst)
++	}
++
++	/**
++	 * Writes a burst of [period] bytes: the preamble, [payload] (big-endian bytes, swapped into little-endian words) and
++	 * zero padding.
++	 */
++	protected fun createBurst(dataType: Int, lengthCode: Int, payload: List<ByteBuffer>, period: Int): ByteBuffer {
++		val burst = obtainBurst(period)
++		burst.putShort(SYNC_WORD_1)
++		burst.putShort(SYNC_WORD_2)
++		burst.putShort(dataType.toShort())
++		burst.putShort(lengthCode.toShort())
++		for (part in payload) {
++			val source = part.duplicate().order(ByteOrder.BIG_ENDIAN)
++			while (source.remaining() >= 2) burst.putShort(source.getShort())
++			// A final lone byte is MSB aligned
++			if (source.hasRemaining()) burst.putShort((source.get().toUByte().toInt() shl Byte.SIZE_BITS).toShort())
++		}
++		while (burst.hasRemaining()) burst.put(0)
++		burst.flip()
++		return burst
++	}
++
++	private fun obtainBurst(size: Int): ByteBuffer {
++		val iterator = freeBursts.iterator()
++		while (iterator.hasNext()) {
++			val buffer = iterator.next()
++			if (buffer.capacity() >= size) {
++				iterator.remove()
++				buffer.clear().limit(size)
++				return buffer
++			}
++		}
++		return ByteBuffer.allocateDirect(size).order(ByteOrder.LITTLE_ENDIAN)
++	}
++
++	companion object {
++		const val CARRIER_SAMPLE_RATE = 192_000
++		const val CARRIER_FRAME_BYTES = 16
++		const val BURST_HEADER_SIZE = 8
++
++		private const val SYNC_WORD_1: Short = 0xF872.toShort()
++		private const val SYNC_WORD_2: Short = 0x4E1F
++		private const val MAX_FREE_BURSTS = 16
++
++		fun forTrueHd(trueHd: Boolean): IecPacker = if (trueHd) TrueHdIecPacker() else DtsHdIecPacker()
++	}
++}
++
++/** DTS and DTS-HD as IEC 61937 type IV bursts at the 768 kHz rate (FFmpeg `-dtshd_rate 768000`). */
++@Suppress("MagicNumber")
++internal class DtsHdIecPacker : IecPacker() {
++	private val header = ByteArray(START_CODE.size + 2).also { START_CODE.copyInto(it) }
++	private var coreOnlyFramesLeft = 0
++	private var loggedInvalidFrame = false
++
++	override fun pack(input: ByteBuffer, output: MutableCollection<ByteBuffer>) {
++		val frame = input.duplicate().order(ByteOrder.BIG_ENDIAN)
++		val position = frame.position()
++		val size = frame.remaining()
++		if (size < MIN_FRAME_SIZE || frame.getInt(position) != CORE_SYNC_WORD) return logInvalidFrame("no core sync word")
++
++		val blocks = ((frame.getShort(position + 4).toInt() shr 2) and 0x7f) + 1
++		val coreSize = ((frame.getInt(position + 4) shr 4) and 0x3fff) + 1
++		val sampleRate = SAMPLE_RATES[(frame.get(position + 8).toInt() shr 2) and 0x0f]
++		if (sampleRate == 0) return logInvalidFrame("unknown sample rate")
++
++		val period = DTS_HD_RATE * (blocks shl 5) / sampleRate
++		val subtype = Integer.numberOfTrailingZeros(period) - 9
++		if (Integer.bitCount(period) != 1 || subtype !in 0..5) return logInvalidFrame("impossible repetition period $period")
++
++		// Strip the HD part for a while if the frame does not fit in the burst
++		val burstSize = period * 4
++		if (header.size + size > burstSize - BURST_HEADER_SIZE) {
++			if (coreOnlyFramesLeft == 0) Timber.w("DTS-HD bitrate too high, temporarily sending core only")
++			coreOnlyFramesLeft = sampleRate * FALLBACK_SECONDS / (blocks shl 5)
++		}
++		var payloadSize = size
++		if (coreOnlyFramesLeft > 0 && coreSize <= size) {
++			payloadSize = coreSize
++			coreOnlyFramesLeft--
++		}
++
++		header[START_CODE.size] = (payloadSize shr 8).toByte()
++		header[START_CODE.size + 1] = payloadSize.toByte()
++		val payload = frame.duplicate().apply { limit(position + payloadSize) }
++		val outBytes = header.size + payloadSize
++		// Align so that (length_code & 0xf) == 0x8, as FFmpeg does
++		val lengthCode = ((outBytes + 0x8 + 0xf) and 0xf.inv()) - 0x8
++		output.add(createBurst(DATA_TYPE_DTS_HD or (subtype shl 8), lengthCode, listOf(ByteBuffer.wrap(header), payload), burstSize))
++	}
++
++	override fun reset() {
++		coreOnlyFramesLeft = 0
++	}
++
++	private fun logInvalidFrame(reason: String) {
++		if (loggedInvalidFrame) return
++		loggedInvalidFrame = true
++		Timber.w("Dropping DTS frame: $reason")
++	}
++
++	private companion object {
++		const val DATA_TYPE_DTS_HD = 0x11
++		const val DTS_HD_RATE = 768_000
++		const val CORE_SYNC_WORD = 0x7FFE8001
++		const val MIN_FRAME_SIZE = 9
++		const val FALLBACK_SECONDS = 60
++		val START_CODE = byteArrayOf(0x01, 0, 0, 0, 0, 0, 0, 0, 0xfe.toByte(), 0xfe.toByte())
++		val SAMPLE_RATES = intArrayOf(0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 0, 0)
++	}
++}
++
++/** TrueHD access units collected into MAT frames (IEC 61937 data type 0x16). */
++@Suppress("MagicNumber")
++internal class TrueHdIecPacker : IecPacker() {
++	private val matFrame = ByteArray(MAT_FRAME_SIZE)
++	private val matFrameBuffer = ByteBuffer.wrap(matFrame)
++	private var filled = 0
++	private var samplesPerFrame = 0
++	private var previousInputTiming = 0
++	private var previousFrameSize = 0
++	private var outputTiming = 0
++	private var outputTimingValid = false
++	private var outputInputDelta = 0
++
++	private class AccessUnitInfo(val inputTiming: Int, val outputTiming: Int?)
++
++	override fun pack(input: ByteBuffer, output: MutableCollection<ByteBuffer>) {
++		// Media3 delivers several access units per buffer
++		val data = input.duplicate().order(ByteOrder.BIG_ENDIAN)
++		var offset = data.position()
++		while (offset + MIN_ACCESS_UNIT_SIZE <= data.limit()) {
++			val size = ((data.get(offset).toInt() and 0x0f shl 8) or (data.get(offset + 1).toInt() and 0xff)) * 2
++			if (size < MIN_ACCESS_UNIT_SIZE || offset + size > data.limit()) {
++				Timber.w("Dropping TrueHD buffer: invalid access unit size $size")
++				return
++			}
++			val accessUnit = data.duplicate().order(ByteOrder.BIG_ENDIAN).apply {
++				limit(offset + size)
++				position(offset)
++			}
++			packAccessUnit(accessUnit, output)
++			offset += size
++		}
++	}
++
++	override fun reset() {
++		filled = 0
++		samplesPerFrame = 0
++		previousFrameSize = 0
++		outputTimingValid = false
++	}
++
++	private fun packAccessUnit(accessUnit: ByteBuffer, output: MutableCollection<ByteBuffer>) {
++		val info = parseAccessUnit(accessUnit) ?: return
++		if (samplesPerFrame == 0) return // No major sync seen yet
++
++		val padding = computePadding(info)
++		if (outputTimingValid) outputInputDelta = ((outputTiming - samplesPerFrame) - info.inputTiming).toShort().toInt()
++
++		previousFrameSize = fillMatFrames(accessUnit, padding, output)
++		previousInputTiming = info.inputTiming
++	}
++
++	/** Reads the input timing, and from a major sync the frame size and (if present) the output timing. */
++	private fun parseAccessUnit(accessUnit: ByteBuffer): AccessUnitInfo? {
++		val start = accessUnit.position()
++		val inputTiming = accessUnit.getShort(start + 2).toInt() and 0xffff
++		val data = start + 4
++		val size = accessUnit.remaining() - 4
++		if (size < 6 || accessUnit.getInt(data) ushr 8 != MAJOR_SYNC) return AccessUnitInfo(inputTiming, null)
++
++		val format = accessUnit.get(data + 3).toInt() and 0xff
++		val rateBits = when (format) {
++			FORMAT_TRUEHD -> (accessUnit.get(data + 4).toInt() and 0xff) shr 4
++			FORMAT_MLP -> (accessUnit.get(data + 5).toInt() and 0xff) shr 4
++			else -> return null
++		}
++		samplesPerFrame = 40 shl (rateBits and 3)
++		if (size < 27) return AccessUnitInfo(inputTiming, null)
++
++		var majorSyncSize = 28
++		if (format == FORMAT_TRUEHD && accessUnit.get(data + 25).toInt() and 1 != 0) {
++			majorSyncSize += 2 + ((accessUnit.get(data + 26).toInt() and 0xff) shr 4) * 2
++		}
++		if (majorSyncSize > size) return AccessUnitInfo(inputTiming, null)
++
++		val substreams = (accessUnit.get(data + 16).toInt() and 0xff) shr 4
++		val bits = BitReader(accessUnit, data + majorSyncSize, size - majorSyncSize)
++		return AccessUnitInfo(inputTiming, readOutputTiming(bits, substreams))
++	}
++
++	/** Output timing from the first substream's restart header, as in FFmpeg's `truehd_parse_access_unit`. */
++	private fun readOutputTiming(bits: BitReader, substreams: Int): Int? {
++		if (substreams <= 0) return null
++		repeat(substreams) {
++			if (bits.left < 16) return null
++			val extraWord = bits.readBit()
++			bits.skip(15)
++			if (extraWord) {
++				if (bits.left < 16) return null
++				bits.skip(16)
++			}
++		}
++		val blockHeaderExists = bits.left >= 1 && bits.readBit()
++		val restartHeaderExists = blockHeaderExists && bits.left >= 1 && bits.readBit()
++		if (!restartHeaderExists || bits.left < 13 + 1 + 16) return null
++		if (bits.read(13) != RESTART_SYNC_WORD) return null
++		bits.skip(1) // noise_type
++		return bits.read(16)
++	}
++
++	/** Bytes of zero padding to insert before this access unit so the MAT timing matches the input timing. */
++	private fun computePadding(info: AccessUnitInfo): Int {
++		var padding = 0
++		var discontinuity = false
++		outputTiming = (outputTiming + samplesPerFrame) and 0xffff
++		if (info.outputTiming != null) {
++			if (outputTimingValid && info.outputTiming != outputTiming) {
++				discontinuity = true
++				val currentDelta = ((info.outputTiming - samplesPerFrame) - info.inputTiming).toShort().toInt()
++				val previousPadding = if (previousFrameSize != 0) NOMINAL_AU_SPACING - previousFrameSize else 0
++				padding = previousPadding + (outputInputDelta - currentDelta) * (NOMINAL_AU_SPACING / samplesPerFrame)
++			}
++			outputTiming = info.outputTiming
++			outputTimingValid = true
++		}
++		if (previousFrameSize != 0 && !discontinuity) {
++			val deltaSamples = (info.inputTiming - previousInputTiming) and 0xffff
++			padding = deltaSamples * NOMINAL_AU_SPACING / samplesPerFrame - previousFrameSize
++		}
++		if (padding !in 0..MAX_PADDING) {
++			Timber.w("Ignoring unusual TrueHD timing, padding $padding")
++			padding = 0
++		}
++		return padding
++	}
++
++	/** Copies padding and data into MAT frames, emitting each frame once full; returns the space the unit used. */
++	private fun fillMatFrames(accessUnit: ByteBuffer, initialPadding: Int, output: MutableCollection<ByteBuffer>): Int {
++		var padding = initialPadding
++		var frameSize = accessUnit.remaining()
++		var next = MAT_CODE_POSITIONS.indexOfFirst { filled <= it }
++		check(next >= 0) { "MAT frame overfilled ($filled)" }
++
++		while (padding > 0 || accessUnit.hasRemaining() || MAT_CODE_POSITIONS[next] == filled) {
++			if (MAT_CODE_POSITIONS[next] == filled) {
++				val code = MAT_CODES[next]
++				code.copyInto(matFrame, filled)
++				filled += code.size
++				var codeRemaining = code.size
++				next++
++				if (next == MAT_CODES.size) {
++					next = 0
++					output.add(createBurst(DATA_TYPE_TRUEHD, MAT_FRAME_SIZE, listOf(matFrameBuffer), MAT_BURST_SIZE))
++					filled = 0
++					// The gap between MAT frames counts as well
++					codeRemaining += MAT_BURST_SIZE - MAT_FRAME_SIZE
++				}
++				// The MAT code counts as padding, the rest of it as part of the frame
++				val countedAsPadding = minOf(padding, codeRemaining)
++				padding -= countedAsPadding
++				frameSize += codeRemaining - countedAsPadding
++			}
++
++			val space = MAT_CODE_POSITIONS[next] - filled
++			if (padding > 0) {
++				val count = minOf(space, padding)
++				matFrame.fill(0, filled, filled + count)
++				filled += count
++				padding -= count
++				if (padding > 0) continue
++			}
++			if (accessUnit.hasRemaining()) {
++				val count = minOf(MAT_CODE_POSITIONS[next] - filled, accessUnit.remaining())
++				accessUnit.get(matFrame, filled, count)
++				filled += count
++			}
++		}
++		return frameSize
++	}
++
++	/** MSB-first bit reader over part of a buffer. */
++	private class BitReader(private val buffer: ByteBuffer, private val offset: Int, length: Int) {
++		private val end = length * 8
++		private var position = 0
++
++		val left get() = end - position
++
++		fun skip(count: Int) {
++			position += count
++		}
++
++		fun readBit() = read(1) == 1
++
++		fun read(count: Int): Int {
++			var value = 0
++			repeat(count) {
++				val byte = buffer.get(offset + (position shr 3)).toInt()
++				value = (value shl 1) or ((byte shr (7 - (position and 7))) and 1)
++				position++
++			}
++			return value
++		}
++	}
++
++	private companion object {
++		const val DATA_TYPE_TRUEHD = 0x16
++		const val MAT_BURST_SIZE = 61440
++		const val MAT_FRAME_SIZE = 61424
++		const val MAX_PADDING = MAT_FRAME_SIZE * 2
++		const val MIN_ACCESS_UNIT_SIZE = 10
++
++		// One 48 kHz frame lasts 1/1200 s; at 768 kHz * 4 bytes that is 2560 bytes (the same for 44.1 kHz).
++		const val NOMINAL_AU_SPACING = 2560
++		const val MAJOR_SYNC = 0xf8726f
++		const val FORMAT_TRUEHD = 0xba
++		const val FORMAT_MLP = 0xbb
++		const val RESTART_SYNC_WORD = 0x31ea shr 1
++
++		val MAT_START_CODE = byteArrayOf(
++			0x07, 0x9E.toByte(), 0x00, 0x03, 0x84.toByte(), 0x01, 0x01, 0x01, 0x80.toByte(), 0x00,
++			0x56, 0xA5.toByte(), 0x3B, 0xF4.toByte(), 0x81.toByte(), 0x83.toByte(), 0x49, 0x80.toByte(), 0x77, 0xE0.toByte(),
++		)
++		val MAT_MIDDLE_CODE = byteArrayOf(
++			0xC3.toByte(), 0xC1.toByte(), 0x42, 0x49, 0x3B, 0xFA.toByte(), 0x82.toByte(), 0x83.toByte(), 0x49, 0x80.toByte(),
++			0x77, 0xE0.toByte(),
++		)
++		val MAT_END_CODE = byteArrayOf(
++			0xC3.toByte(), 0xC2.toByte(), 0xC0.toByte(), 0xC4.toByte(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x97.toByte(), 0x11,
++		)
++		val MAT_CODES = arrayOf(MAT_START_CODE, MAT_MIDDLE_CODE, MAT_END_CODE)
++		val MAT_CODE_POSITIONS = intArrayOf(0, 30708, MAT_FRAME_SIZE - MAT_END_CODE.size)
++	}
++}
+diff --git a/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt b/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
+new file mode 100644
+index 000000000..8cc3986f3
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
+@@ -0,0 +1,25 @@
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import android.content.Context
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.DefaultRenderersFactory
++import androidx.media3.exoplayer.audio.AudioSink
++import androidx.media3.exoplayer.audio.AudioTrackAudioOutputProvider
++import androidx.media3.exoplayer.audio.DefaultAudioSink
++
++/**
++ * [DefaultRenderersFactory] whose audio sink plays DTS, DTS-HD and TrueHD through [IecAudioOutputProvider].
++ */
++@OptIn(UnstableApi::class)
++class IecRenderersFactory(context: Context) : DefaultRenderersFactory(context) {
++	override fun buildAudioSink(
++		context: Context,
++		enableFloatOutput: Boolean,
++		enableAudioOutputPlaybackParams: Boolean,
++	): AudioSink = DefaultAudioSink.Builder(context)
++		.setEnableFloatOutput(enableFloatOutput)
++		.setEnableAudioOutputPlaybackParameters(enableAudioOutputPlaybackParams)
++		.setAudioOutputProvider(IecAudioOutputProvider(AudioTrackAudioOutputProvider.Builder(context).build()))
++		.build()
++}
+diff --git a/playback/media3/exoplayer/src/test/kotlin/audio/IecPackerTests.kt b/playback/media3/exoplayer/src/test/kotlin/audio/IecPackerTests.kt
+new file mode 100644
+index 000000000..fccb9e7e0
+--- /dev/null
++++ b/playback/media3/exoplayer/src/test/kotlin/audio/IecPackerTests.kt
+@@ -0,0 +1,87 @@
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import io.kotest.core.spec.style.FunSpec
++import io.kotest.matchers.shouldBe
++import java.nio.ByteBuffer
++import java.security.MessageDigest
++
++/**
++ * Compares the packers with FFmpeg's spdif muxer. The fixtures are 0.2 s of a 440 Hz 5.1 sine created with FFmpeg:
++ *
++ * ```
++ * ffmpeg -f lavfi -i "sine=f=440:d=0.2" -af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0" -c:a dca -strict -2 -b:a 768k -f dts dts-core.dts
++ * ffmpeg -f lavfi -i "sine=f=440:d=0.2" -af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0" -c:a truehd -strict -2 -f truehd truehd.thd
++ * ```
++ *
++ * The expected hashes are of `ffmpeg -i dts-core.dts -c copy -f spdif -dtshd_rate 768000` and
++ * `ffmpeg -i truehd.thd -c copy -f spdif`.
++ */
++class IecPackerTests : FunSpec({
++	fun resource(name: String) = requireNotNull(IecPackerTests::class.java.getResourceAsStream("/iec/$name")).readBytes()
++
++	fun ByteArray.u16(offset: Int) = (this[offset].toInt() and 0xff shl 8) or (this[offset + 1].toInt() and 0xff)
++
++	fun packAll(packer: IecPacker, buffers: List<ByteBuffer>): ByteArray {
++		val bursts = mutableListOf<ByteBuffer>()
++		buffers.forEach { packer.pack(it, bursts) }
++		val output = ByteBuffer.allocate(bursts.sumOf { it.remaining() })
++		bursts.forEach { output.put(it) }
++		return output.array()
++	}
++
++	fun ByteArray.sha256() = MessageDigest.getInstance("SHA-256").digest(this).joinToString("") { "%02x".format(it) }
++
++	test("DTS is packed as type IV like FFmpeg") {
++		val stream = resource("dts-core.dts")
++		val frames = buildList {
++			var offset = 0
++			while (offset < stream.size) {
++				val frameSize = ((stream.u16(offset + 5) shl 8 or (stream[offset + 7].toInt() and 0xff)) shr 4 and 0x3fff) + 1
++				add(ByteBuffer.wrap(stream, offset, frameSize).slice())
++				offset += frameSize
++			}
++		}
++
++		val output = packAll(DtsHdIecPacker(), frames)
++
++		output.size shouldBe 622_592
++		output.sha256() shouldBe "d4a9ab67a13afb00b064974b65b7ab20c0bed50fc30b2be5b58ff7003ba2880c"
++	}
++
++	test("TrueHD is packed into MAT frames like FFmpeg") {
++		val stream = resource("truehd.thd")
++		val accessUnits = buildList {
++			var offset = 0
++			while (offset < stream.size) {
++				val size = (stream.u16(offset) and 0x0fff) * 2
++				add(offset to size)
++				offset += size
++			}
++		}
++		// Media3 delivers 16 access units per buffer
++		val buffers = accessUnits.chunked(16).map { chunk ->
++			val start = chunk.first().first
++			val end = chunk.last().let { it.first + it.second }
++			ByteBuffer.wrap(stream, start, end - start).slice()
++		}
++
++		val output = packAll(TrueHdIecPacker(), buffers)
++
++		output.size shouldBe 552_960
++		output.sha256() shouldBe "5bdae6584a54af0977818bd91011fa72c72488c3343c654201362850d5df0269"
++	}
++
++	test("Recycled bursts are reused") {
++		val stream = resource("dts-core.dts")
++		val frameSize = ((stream.u16(5) shl 8 or (stream[7].toInt() and 0xff)) shr 4 and 0x3fff) + 1
++		val packer = DtsHdIecPacker()
++		val bursts = mutableListOf<ByteBuffer>()
++
++		packer.pack(ByteBuffer.wrap(stream, 0, frameSize).slice(), bursts)
++		val first = bursts.removeFirst()
++		packer.recycle(first)
++		packer.pack(ByteBuffer.wrap(stream, 0, frameSize).slice(), bursts)
++
++		(bursts.single() === first) shouldBe true
++	}
++})
+diff --git a/playback/media3/exoplayer/src/test/kotlin/audio/IecPositionSmootherTests.kt b/playback/media3/exoplayer/src/test/kotlin/audio/IecPositionSmootherTests.kt
+new file mode 100644
+index 000000000..14282b5ef
+--- /dev/null
++++ b/playback/media3/exoplayer/src/test/kotlin/audio/IecPositionSmootherTests.kt
+@@ -0,0 +1,49 @@
++package org.jellyfin.playback.media3.exoplayer.audio
++
++import io.kotest.core.spec.style.FunSpec
++import io.kotest.matchers.longs.shouldBeLessThanOrEqual
++import io.kotest.matchers.shouldBe
++
++class IecPositionSmootherTests : FunSpec({
++	val stepNanos = 10_000_000L
++	val stepUs = 10_000L
++
++	/** Feeds positions every 10 ms starting at [startUs], with [offsetUs] added to the track position from [jumpAt]. */
++	fun run(startUs: Long, steps: Int, jumpAt: Int, offsetUs: Long): List<Long> {
++		val smoother = IecPositionSmoother()
++		return (0 until steps).map { i ->
++			val raw = startUs + i * stepUs + if (i >= jumpAt) offsetUs else 0
++			smoother.smooth(raw, i * stepNanos)
++		}
++	}
++
++	test("Steady positions pass through unchanged") {
++		run(startUs = 5_000_000, steps = 100, jumpAt = Int.MAX_VALUE, offsetUs = 0) shouldBe
++			(0 until 100).map { 5_000_000 + it * stepUs }
++	}
++
++	test("A small timestamp jump is absorbed gradually") {
++		val positions = run(startUs = 5_000_000, steps = 300, jumpAt = 10, offsetUs = 44_000)
++
++		// Each 10 ms step moves at most 2 % + 0.2 ms faster than real time
++		positions.zipWithNext { a, b -> b - a }.forEach { it shouldBeLessThanOrEqual stepUs + stepUs / 50 + 200 }
++		// After 3 s the jump is fully followed
++		positions.last() shouldBe 5_000_000 + 299 * stepUs + 44_000
++	}
++
++	test("A large jump is followed immediately") {
++		val positions = run(startUs = 5_000_000, steps = 20, jumpAt = 10, offsetUs = 500_000)
++
++		positions[10] shouldBe 5_000_000 + 10 * stepUs + 500_000
++	}
++
++	test("The position never moves backwards") {
++		val positions = run(startUs = 5_000_000, steps = 50, jumpAt = 10, offsetUs = -40_000)
++
++		positions.zipWithNext { a, b -> b - a }.forEach { (it >= 0) shouldBe true }
++	}
++
++	test("The first second follows the track directly") {
++		run(startUs = 0, steps = 50, jumpAt = 10, offsetUs = 30_000)[10] shouldBe 10 * stepUs + 30_000
++	}
++})
+diff --git a/playback/media3/exoplayer/src/test/resources/iec/dts-core.dts b/playback/media3/exoplayer/src/test/resources/iec/dts-core.dts
+new file mode 100644
+index 0000000000000000000000000000000000000000..265cb92b19e5aad7f59b8e26f67c87bed67a1947
+GIT binary patch
+literal 19456
+zcmeI31yEJp{=W}!2nD3OLqfU*Q91>ryQGmW=@gJIMY^P0I+PA+B&4LIyA+WA?*sV0
+zzW0rLXMT<||2ub&bM|sA_Bwku^JTC7?C0Zo?ge$q%eUt+3wsxIW7~E5;^M*!1mgTe
+z83n5d0)fC$5|ogCK=X$U{6qV<Cb#YS_(`x{*$1Epo>9w{&&FKY1v0wWU2MF?5Y*2P
+zv<Yh*HqP2g)K-8tOblaPN_8dOeW3l9TazFqj%8ehZm%m=2o|GajbLlnV7_GLotJqS
+z)W3QR1dT1{B##3vb9tsvXQz<;`OPKifPim0(-QYLD)YpAqg=-#R2nYQz}nzOT<;zD
+zMvyKD6@&l+gP=iBAdnY`pBWYDasv3n9bgahjV_LpoZ_>mGv#6FL@qJ9#I~M*_Qkm`
+zniB>{55AEE1O*%eBK={KMt<hY2}oudfj!D>k-=C%xZl~ri|Ots8BP+^b%C(17ssd~
+zvr<q2Bp^2s-1QfKp9BU91UV1{^7Mp!^7+)f&?A3<a~So=l_4+kGiCAtCD!)EiU5u`
+zGaRWK)D8&uhqH%Ff&_+v90>Y9TmqD|jy%lJq8NPshZz)KVZI?o8j+751@r{X>^<Vb
+zs8cpjzKC+Q7e`lYICt`VF6@<vc^6bK+X&-5i-ZIN1Es4=j|A)O^@bT69!l4m=$43V
+zhJ}6gAhZ@4Nh(RBW-tqOe~&0+4(IBmwKDRm(-)s!^G9V~d}%r5p#;ySHNx)sg9uST
+zy1KZyh`&#F7ZJv5#rBRLg;{2M1o|q%8R#5(K`o%tLyrwIM{n!4QXE#pLh=+kIGX7q
+zndI{TDK+dZ5YtO$(5w>-45+bD_4nx-RSDsRA{A)~v>4gFV#LK(;CFDydqm2<pk2;k
+zN$pb5QFuXluo6L;>v_6!aVrq&E{!#mTbdU<Od~EX931rT)7^q@oaG@5N)w-0waEb2
+z3i9#udDUR+F{H$XK<4;jbMK>(h}98wm9Y2ihZoDwzuAl5XcF>5TtouhB?eB5nHl@{
+z>8yc^c5#0B8-#p#{$2fBRKi~<-Dv>+99(aZU-@r`{m{52E6R#Qh9HRQ`}+suPwpfA
+z;rqTfanw*r`Ab-ZpTD3Hj${??K&6sRV{MZ}p%V5+cl^a;x*&3zt-Kap(QU+8QLs^>
+z{<fX-{9`OrA+~Ky?wGo#@)C;R1^TV6pn9eUye!YzP-?ikyEAujYC&Ue2_e{J!|S@@
+z7`Z8m+8mX=@0h%C(c*2w>w1?%eU&ni`rpYeY449q+?K_ND0^Fb=i9q)JMDx$4;E&a
+z7-L$sS709RSu(5lD-?Q@%4E6AIgNbc+^Glaikh}RIOIy^L{omr_Fz{i&UMs~GMZmT
+zuy1Q6f9}hC3$7jW$qTo4wK{07smRYetDDU3%T$8BdE)j(<~7VeHGf0%#>>V%nVfbS
+z6H%A#Icd9PxUKavN(qV^@!s3l#lijINRNA3wxsv=R^3Flyf{gy=3xu=dB)JeYsMdO
+zLM_Uy{_mG!1@HX5WClHsMRTR7%qyn%HME*>@B#Gs%!FT0-j=AyXdHH&M$h4&c)CT^
+zue!|GiSpNK``!VQ_f-!G^t1Lv=DHRv<ei%QZ<fEjE}oDZ{Xf({2$YxC@V)vkE-vei
+z|9kcQu!ng`j{5A6^-qTQllu^U_`dH=*b!j_py<7!VS_MeWa9+E645lWO?n15UXb%=
+z{^GGz_-$CEr_^tt3colsN>UOpYSB1j$jgdzW(RJMV>b`XbBFn^6{4Z1N2pz>Eqp-w
+zhT8&bTFnqCVoA!0ButaI)R01x;a|~o9@N)BS)5P=Ek}BIXH}>pKFUX+g7=X}M<sSR
+zUXMMsl1V@`p-=yDKb4npV>>RLbdz}yoek6*Ju=~Cj?*I%N{%9wugVTbx80_!(F5UY
+zR3wRohhL&2=gzqvh`cFx>eEl-$rl#RS-|!jab|~k0LR><Zi#3hrxAes4DBX0ckyx;
+zEm@(p=j*cKPP(Oaub1NYyJ}_ks4`L`EFNLZlrs3Gx7!ij_^3{PTa2{qysR@7Z->SI
+z=8&}pdC(-kIc|U)cdzFIISFL5XJ=SR9uhiSn&8(0TS|k^BROt^pFMF(K8rMGAZCkQ
+zk;xlCyTc8evY#vs>h}&|R!;C4$5ft!(QOqB>@z#s3lcZeBv~m~-;-E3UrnqH1#==Z
+zift%9F?i~ky$NsIgs-!LGGdoK6EA&wtQgROHdhhbXMJ8-MMpX2-C0M`NQrKor8+x@
+zl(Uj>)M$9$B8e?VF4ey&v*Ro%R4T0h>sjiSD#gPysN+8SlP?ktDUy-6dc4YIczq-z
+zBZ~$JsN7r`PGBFYuib=%0?|Ymo_CS53(K->*Vs|V*lS2i<Z>g&&r`~Yy1}NNseEdE
+zDITU=UsmNQki>#U^toG(CngJC=)qHc4F^R?B**DL3t&xuZM6*ba=+5PPfOH?04|2&
+z;0_1tJ-(rXXEnN^Okd&GxrerUsm|T+2tN+kRqrvr>#3m;9c9kHFdaFIeuHg@-r5FE
+z(O&v=mNmJuFRnZ1gOKjvf=8QZmYDIe#|KAxw9Ip_Gh-h2ql}sUOz{vFVmh^uWt4R@
+z+fwNO!h}IyXaOo0!?0VVU15O@iEt_x-!ALuAL<`E|KeZj|8MU9{(|7&Z~d1oM%ka+
+zNBX_yf7k=}e`2XLbV>;{N^x&NLvb`p)zrPV;0Q|oNNC{x|4YYoLHs-=HnpBcoTX#j
+z%$>-+cb4N`#NqhT_PT!Rc20dRHDVq)ng9OY?b^wk-5gFN^$xd@2<n%_Uj(ZMh%%4F
+zJNB72`ZlNMYzn<U1e>Xu6UG|&FGbt+boK-{V=mQgF24I9lx4;#zNIvu6g6cDYZ(6y
+zWriopA9==(QlhO;m;%>K`rb18tl(q0;iqZyCq5hnmA9l=h3q72mJF6eKHs#{KG>T!
+zAsgaIpme;m+t+DX1zp;!4ZocvAq2Nw6Gb^U@)|9KBP;1kyfqnf&e}cM-LoeA5e;}M
+zJhGZh%`dEW<U4-c#jeg)?5L~py;1j~ot6!%G`!V}ieV1>GSZ$oPIjW(n8_iu;}6Lk
+z_1;B|RdgWAaXOz3HDh@80x4p0u*f-%JJLxoakTDTRXl=yuTdva*E_pXjl#x)G8ONW
+zWqH}Aw_65*cPnyy^^r}p-Ifv&r0(#94fA?hi%wW+gmsA+xai%*d3qCXv9!7&v5=6I
+zD@W&o<kXCld@e68Vlt-Yl(D2>67z%qgt}4ptp4+ZQJF*adMKZL&f{cX%%t-FP4ee!
+z0^HR9P5tK;|F!_QEIs}o3h;Xq<|R6&H|ihO|G@qK=l1>e{a>g9os>V0+z$bhN;Xm+
+zEFMk6UnB2}fI%tcH}Y%8yg;a3Z;w-}(cTu+?KjmRny4$Qj;xx63Ef<qUWIP%um~pV
+zdPKlrGt*&s;Dek>4>uJ%Li@6<PaWHI?Sq$b{eDqQu?Vd`<`aZLD9;UtnEGliG7Ch>
+zZu}_*n~uj?8dIdIYRDz}H4^iNMfZ-7>OTmS!+L!x!*64at?3r*y|0dnbU0lxxWAG~
+zuNNwS&(CxgR(d!Jx4@8Qs-~}zS;UP*m+zW^h)7mR??}sQUh&?OEM@|M)9VevQ+?Ge
+z1srY@wd{OBsN|E8TJ1W_%n-R83USzrk`e9W*-5{020D5(`-=Buehyal-j5A9+rk#9
+zLtj;IFR-2nz<t1mvFtI!?9y9iKxE%H;b)t18GShV`ejKF2iO$UaKO_&qe&1^>6d93
+zYWb>qfw`z~D}tWhf2?FOW4Cma=+s}wgmePB(PBJQFHTBxG0iBs5CP70TYc5#tNbe#
+z(bP~<ob%43H0|e>;j15U+D;gsHM2Jxb#nwKo_u;xtmR%4USes}|3OIg;SvnG?UqBi
+z(e%h1oGOXASee%C^|RTr_1sXYR*JkuK6bhfn*(P&ufH`IesB_vl^QoHu}g6^{<vOT
+z#d5&V$9;@ocEhbvPe!Y+GUU_5B!4%|X25}2MxEz70wM>N+*n@+&Fm#V7ou9eY(*WM
+zjan3hp&JSGBaC+2=Erpo2TKpyYTok+AU|e`MUv>Q85u}$)d;}TbuS_AwT~%2e5PNN
+z#leOemjCkfL$Oem*w?k-xw9C7&-jno4CCAS+&5EHis~odk5%1WULh;E{RJwJ+mUC2
+z&C1LMh90GoV!SA7|9r>XVYod@5ACCEN<7xe)0OiiIX9is6<!J{D)Tbcn*O@7wf)gg
+zu_xHeglAw5-+EmZYQ|*^QHxDWQbX^9R#%Qe?S^UOu-e$+9zmWWor~Fjs()A|r91yx
+z{{V>ki)|6Xm!|p0=YL=k@U#2=;%lKCBB8-SFDRwb<o(27lFNGSQQkynR7~A7=)k1@
+z#bZ=3`za)1ON4MbyV|!nvkGaR2}WU`B>I_<gPe~0y2T&R3V*PPDaP8{)(Db?4ku)9
+zFAB%zQjU0_-e>CZ5%qRG`HB5HMlh2aZO)u7oY34mLJMhiIXFK`hC}X~AA~`>`$?}N
+z+~fmO=b5zW7N@H)Q(=kknucl-(_0pjx>Y0&p5>7~bQ3vP9ihh7E>)0gZA5zB=5%)=
+zzWg=vO>vDaTddRosQLAK45Z&OF$CJR->G!hS<>>~<h35cujN&pQs+N1<IX%$<bU-o
+zcyp*ghQ7`qD?QK)4<%^Frh>y%7#}mDYI1>202Su_$WwKJT}i5EA$3m0F)owxUYJgw
+zvpDRXN@~l!_eSg<9^`m4?BaaNR!vlM>68}30I`x_&CWl0G8n*4OJ-Hmq3lBnA6~Fg
+z{%r20G(4Wmt`6gVbtZ^rw?*p7%C5eHDa>NQQp~0tw8k7$l}yRq(*3CTFe;D%z6k64
+zYo=f|Vh!OMc&Q!u#Z|G9SsMzb9STpu_RO<Ly1RZY{jV53+ln1RIk~9A8E{6@HiZ3?
+z;!cCB#m5F|U)^)kfo7&)pZ6&9eiKxl+6%}3(fwU(D3@M>j9|hWinQk-efSVYVz&~z
+za|YJ}(~=rqXOsF06g^7zjs69#X3_RYsgi3tLa?8R3=kSP6IQtV%_U0Hx0n;Qm{Z<F
+zNOxgyc^_MUSqx6uHJj3x4(*)p7TM2nMI*~L@+99v=VT8u44cMj3_<9<J5w-gPF_gE
+zCJ@1)W5q%tJ(e{Tk+p%a^0*PVX&&);3ccn<u=YB>x#c5bb*4h0u|VW|Y)3fOktG=l
+z^iQuj&zUg{z?uZ&k-YOxoCEPK+c*>bxOByYZh_iSa5Z_4^p;Q64^@ZsZJqW8+@BD)
+zikpt7biDNqP5I~g|Ihi~U#$N{e`+7;UsV4U|AQ6|z#x^16ujhrk*te>;Sl~8bIJdH
+z-Iy22xk`y*qE6PpVa>ZU7{0MpMZdTdr;sFiox~dZXPvGBP{}FVjB5_tW8s|&C)u3t
+zUl$z*7wbbYy;iNzhINH_R@30vWV=F*YZ9v-LD1hd`sz7pHCWX<UF^;vemH@E^!38o
+zQK8tQ)k896io0w(o31{F;j2jo{6nX(bZER$X#|#de?_zVJ&Uz&?ps!T{QU<!N@PaH
+z(-hPXah4giNcXfq@Ed2Jbk`=i9#HHlp0D<%xN~cLt+7fMA?49%b-+dKt2Ge_8D>pa
+z+cIVtng=lEF`Q?~U@juS5b=0a8@O#(;iC?GVD9rxYYnf@l#oPaAIg}Ytafc@cDv)#
+zLJdw+<TUy_3<)9`rA6cS+i_c_khmuFe_%TcixyXlI}GR?Y&+_X5$BC5N5xw`-`mR8
+zJ_|UF=Bu?co{>>;XVh335Wn?mmq--MRuqq_&w-RP;u_a&zx#BO&hUz?EZ5LNNP^J>
+zY1p1qXJSi(gF=x;Oyi+O>zG(Q1!K=gvqYy(8{o03V{q8!p0u5t`peLVesx%htcaDL
+zHJGl@%Kc7>TpCIO&H=FFi*~6cqLaKN+sS(P+G(oh`@48gjq)|;+aCrE3v!CSN)Mbc
+zOPCwZc%sR$Qt&xKtLo<XHCx$|l$H=69j^?ac$ds-%)C9Nxc+K!=l;kpC)##EcNvHJ
+zGBK;B@@uqG_6kCoA<Y@=ObYqWRwBkoKAY9b-B)m>-&X#K<PEsqasi@+-51=?J=U@{
+ztC+mEssi7HyNPPW<&ECmjhd@K4UNpqnR^<)^sRyxKL*i-?ydm@ieA$d*Qgf|)MW7*
+zVVgQ6uIJvN63=3d8;Zj_X<yel){S1}n)e|wSUJAtp$uXe<)d6}x#Gjs8Ut!A)ED3W
+zVf_z({;&M+Z=U}}1^<Ho|J1&}tA8ng`XOM`h^Gk}BA`(!rU}6YL=Z~_LZ1Igf904i
+zNWZ%nA#Iil0?VkcI1%RV{Sz$wIM_+IxJPXlO2s3#iXQr&7ZSUuM!XD8%+^zeTWAb(
+zEva9_X($5S_Eq%Y_x0B>WzOw`Kia1)Jkl_hS{yc^1-Ko6i4d!gSW|+}^K}Xqa!%VX
+z&R@)t_Bg5U=zgy4o+Q_3doHj_EGve7v{uxLvi5$MCh2q)Cl8>9*PuwD^$-HiaBTJr
+z`EbsZ8`L`GjzTZas9ObMcPeI^S{!1kg{y*ZJsadr4ZHp2qgDXP$M77vdq;yz5N>yk
+z&H#`(mNVSJIKR;4!E{{cQ5Kc{h2Y}&QNS~n&t^@}{MVVR1Ff)$;4_>B2p=xzy+!5A
+zCy{;a_$5O-KNE%A<r9xFW4Zu<5CL))q4mD=<*ClT`kC=<u_dmHuPJD7`pu)y;E_kP
+zKci36^Pq_D`P_}^S9(h7sr(>KczapA9s<m+Si(%%85@9BXf&oW+dw1ctLMj2&fL-R
+zZw+4S#`1j%dO#dHYG)u6<PyNI$AH(HmDq)0o1U}Wg0kidp??$Ix(h9oTpJfs5G;ay
+zXlldHk-+0wpOGwMs8}>k6HA41Fc<zj-C=SZbuRfeDsHf-ooP0!?_|yz_fE@k8rd6D
+z+iS>k!Z!p#8h&*XnzG17eJR_y)Gy+c=qe?tZah1yPXD|z<;W>~H#^4{j(i|-!n7xi
+z3ji8!%;!1c=J=YSSAfQ&|7)LtHfoyH(-=$`wX*D!HHn2KCCSaGKp));OPX&kTw1-6
+zw`kYMpaRN`IpghUq`Sh>Q;_)b(0|4S`8Uu1d3nD*`~wZ(7W_B$@6U?xXa4t7`~I%}
+z+0)Ps0x>Ct;{*-GBFR<LpclHsDWxv?AL*|g(<Mo2%rAyZU2F%SU2oQY^+txWjM+4V
+zR#jy)O;CoEWR?-JO*-Z~qA4_Ebr61|_eUPhjl5AmXwcpG$y-Cl;$x1FlS6KJ!9bJr
+zC-(egBMYv=_lD%9cG_Rw$o4bTaeE9<8iq2&t|rgdX;cR#qZaWmHyJQn)=33OAH1N_
+zhMT-OVP{z=jL}jk<!%&q({dc3c5J3~miK6}Uc?_J`S?3qtacv+QqY^4zn3~BTAONB
+z-0`!8e}G8#%wf$y(5gI+b%%3Sc__i*328FX6a95|YlWu}jF}+4ZZj@kkU08o1Cy=W
+zN=Bz#0#E;;5sz{8w(=Hvwl7@-_l_D8L9qfkhI>Y5jCU1uW#XrNIq=T90*P9>PeP@s
+z3UALfd|Rqp)=f*+aIrmmE#8f<!7_CJy-Sr17B88mcfU`E?vzU$YQiR!)H~#Atn#HP
+z^#JPU>aoYYgqTxhLuifHWW`idXA8gxoOL^x9<Q|Wg9$@wZZK$~j0coG3RZqV-(D(Z
+z{&2Cx@)4L1cKWPP`yCpihF(@0GKGr=acmgul;L&}a)*ZG+y#VZRBU^te=XhAR9!Ia
+zka#ld(IXP?re3mZ#1W;hr^66z>qPdA@o@9W{%oM_CoB#GQ-YzLudUXM>rC#}mVy&1
+zI41yDK`wTKCCQ9=GWVW>QShM(%z+;L(A>xHV3vXx1n5WR8ZVkqnj9O<REoh5UybGF
+z2#HUpJkO%=c2sj+e`bq4Sls|2JQl9AG-vd0Rj|47Y|+)LNy^ZSQm_l$)Itqn$6~tm
+zCX*375bI9V>zv3nE8C<6@kPI$-e)01ti3`j(QW4t)MPdTCAMlfQC-r}9TD}h@hmo&
+z{ac0pT#p%LduzQ0_QH<Pj@I_X$Mq)k#mYNRPzSlPm;d?xe{qrb$LIgQsef_#A71@m
+z^Z%dQ_t*80LMomMZ6Jw3DjO&$B92C`m`0u{iAoCC0FG+Ec1)LKO6d&;;YIsSc|l3;
+z6|DNKr2!!`62=iYypH#b$4;@d?`IAqKL+^F7^+~5LSYNqW}-4X3_~$Np~L#%VO-gI
+zFg}|meV*W8Y5O&2@^i54PTdK;oy@PfJGq&nzoX=I5F_gB%i-IgD{xawrV2@{(nj?I
+zQsq0#iqYbS(?<P8^d`O5rMVDvc#Vj#KE8z@vscbgcJJ*f-NT!d<|nl9mQY8~&%D93
+z4m^`A#N%!H{HznZwWHc~OwI`ps!P&2n!7Rp>i5LML?!K0`ZpD22<;kFTY&8+>Ki}c
+zgH;JPwKt9hnA-suHFJ2~y4BSfD-_gi*1oRg^0jWs{CKWCWEAmE#80>!)BtNcr)z2-
+z{+P)eR|26S43qAKq{U{jf_J+&kCN-|fD9Qu;kkI$W6P&Xu#d3K9y+~-vnpb0$O0qM
+zj^(Dc+EI2wpx+gkq4n(z2N;C6<@}~8tgB`-TDy)_&;F_`46WTa?wV1}wye#7s*W;s
+zjW$#^cN_OJW>PhoHtAawaa0ljeZ08BApmZ3?-MLXbR;nor<+(p4P!m=FfNw#!h4v~
+z)Z16P#K2`PQZEueI8Ec7upYd<>J8oX^p1%QVJE9hPCe79%Cpeie96ab`VcImQGKE=
+zpgqd$YZLS7%Y7F`P?zTUElY<{7Sp$S414q=uXcrzW;As?r4X<cN)&_wmL#GaM0P!|
+z2$8~#1QNT5Lg=aY6N5JoYJ4d|>SyBC2UFqXmv`*!ifV$TKcQJg8kJWCks2M(ogC}(
+zmnH?p6N<4)HC!|Tcl3Y9{~CT@0YH8laMAv}!Mr4k`1AY!pWFA>{9hOWon9)E)lU)&
+zKmaTYH(t^R*T_HXd_gLk1ib(Mm1D6WTDz9j0F>Q82(r6oGyEt_0I0$-GV$klAv*my
+z&n>tzhAI^%3$9V0YaTIsX@veFsdyM+vI>!?kZ#?2e<kAy8y9Ic8ibQskjLp)`R$N{
+zoFSm<Et@b)K|JRdWQ7H-@)`~h5i=(YUIVTcA7_d2>83}j=wh|%rm2p`^I{PSxwsnG
+z#t?xt2}D!OZX&=YLWSuDK$YKkJXxs0KvnFM6!Oi?&K%IH_Z!^aZ_TSm6~TPVX8X`w
+z49)M&B#$TWyU^l?^mZ_U^&sF-JWF-+vm1gJu?_&L7<&eg%&0=&wJ09pSTIWS!%HE1
+zwOh60JnAh_ySS&5gH~gSeNSCw<n#J~_^^?sfHeiGiM-&%6}S@y?Lk1*Q=<TVHFk?7
+z{OpdmrnXN&Ji6v^Y#z+D9u|82M-ylKq21Oc6NB|tDB3}y>1?)$-uMt&cLfnn^Cj^B
+zs*>pLaF{{qu&D^=A=rKBaC>9NE4GO{cuU6ixK^FQGJ**Hg@ayOoJ=wloCAE0whK!_
+zPGiVW$Q2RUE2J@UpJTPzADxbf9IcSWJ3?fd8jdMzhSmo!G1YK)udSMd*7DmEOMeW;
+zHso;v;|&w1Ij^)^rbDyIuw3DtuJSYp%6LDj<02@g{gK~zfxf{}Ub`RRMhHf1{lYR+
+ze&%b=Rj3cnT*~xnFIQ(#jb&Z@mecWSA;j<f^wO8FNEdeo{UKb2M9Y2k29c{0R7ynY
+z*_4DUFDVtXjNZwM#QLIF0iQD91s0}MON<n<y#$g3)^L(TjMjd_<tV;@$fuXvKRo{f
+z{?G5#|Bvf`fsjA1|9@&9>Gj$ExVz+k-hz|?7&HL?1D^k>6w?6y7eOT)2z|-_e&LuG
+z2+9Pdm(t5W#6C~3=?YeL>YYNsjArt;Pw9A~dat6XGzm1rG!C0iqUUfw&2+49Xy<R)
+z>)*i1@r6b+E213Yu2k>DkKviQZ5;C5dIJE@rS`^gyK_6VmgS`pt*N|WQ$@#OgBwYW
+zHd$!hX;^*RTK%#pb0qM*ONL!LC(V{%SP+?OSGcF_)bn3>GT&_?fJ$8HM8T2n2S=E(
+z`b_6ufpQDXo@#q0aChlTbX_bFTLr5k2vE@4C=!`2wI=>!ky{N>{NKGOK*hNdqZmaF
+zKP|{V4rw@szAYBfbY|R{iaT4{=Dk|Ygm!b9-<($rGtBx*(1KaT<T;lBeK)*D#y?yt
+zUSl;lGggrj{;U@(2+_ns@cSuLUiv=W*zj4i?}X``q2BBg%5yiLyS<LWA4bWLT|c6P
+zqKR;gzT!Lrq!Y>14SEYY?)4&6xZM}2<ciKnBqMI|P+^Gls>BICyQqZ=a4oGi;>(Da
+zUX<*ENTK3|i2wVg5c|jVKdjP!=>G)#1?&I0eScT~QgP_u8`zZMX{-hvfCdEcKfwQy
+z^1kMOziv#IWU_)q`D|wC3%3J4!WG^@818^jCS|z2Cj8MAn1|d$XPNK6+?M2L;nP~@
+zGe$kB3{$Z+5UNcc#KjlsOpb?#M=%tVuNrz*{~ChIke@w_ta#OgA4in3n%LDitxBPO
+z1~N6~@hq=CH^>!-qh7Bw-k2kKI?%Nx72v2aAp|2{!#2b}`xz-`P5Ic`aTtORuW1#9
+z0tEz`sS<R9&2&<c>6afJ#E|qv(}G&h91G48g|;TRwK^kjt+|Tpn&MEom=F?@MH5NR
+z$lN*(yf*JdM>N0?^)Abf4#rtG)a)x%X5#Ak;QUckCMj-8(SAx<fcqygx*ArpsYj+r
+z$m9$C(lF0_S<`bhR-0zzzN>cte7kh-`V4ig=+O#2yx7Z<_$D+xSrs#2F!ra*4s1}~
+znk+g}3E#`zB=gSDj9X2$w)R(apmV=_Z|%Di1>luSDQa2wRn60>A+=J$+HkRZwN>tI
+zbf8%HdQ8%msWk(1y}{QeV+0Wxi9<QUkJAe_j1#sHCL!eS3a%7rqh@n#-vd{4S8f45
+z6V|W`_teL?TePa+#``;IaKzgRq%W|eF+>|Dy%Lv_1Syb-jP-eEtVNfvg(v{6=s}Dq
+z=ds&GT2=NV<`G5d1ASYCGd7ZqR8ZS~2+W5rap2hUoOn*S1@JQa8XB(2`aQg*6CbYc
+zei#5&E(Ni^CI;Khw^?Ndeh$Q8jt-V5LCR3fC~h<Y&)*JrP_|_X54_<brRL6-4QLTl
+z8|&wqM62oa7q`5^Dyr|uAe`xjS&YRL;C9jFe6@R<?>H&{=7yK+XF;U<(^&#k40otP
+zy=$PjdwG0C@p<~%o$F^qXMk6Km)k$w{~`Wgh01SBfXg4}zdGs<pMd|1>HTN__ow##
+z_4*%hd}zM=KXHKn^NNbUMvxNX|0F^DpI<nZ@=YEQ$NY9f?jxd?K^<3+$c?Sr(8jY?
+zTZz{_(<^Zd-E+6#oZ@v++$j|O@=h5(LyI&e=ipJS4w)|>{`T}pv6e3m?fCF8X@CXa
+zcijyTfi8WwDW*Hg4+a}$%y0008}URNP?0(Zy|VkJ7K;5jD~iC>t%oV1nIzP4+f1dX
+z8S&-D+7nb^&J+kgyrx7*d*c8$i-~?jVya8c2~IgR;|o~H&+-I4<UXZu54IkXKrXL0
+z!s&R7(*E|aB7gKTY}Zo<4g_+7NAsnTYS-Y*-`Tu~>F{A!c6j+4j0EUM=Nu`m_DVy1
+zUbhp^vGql&O*8x_bl4CVn4iyUodBHajnCpeo_Jq0<m_DlAcjkcL2s2Fw(wR$xY?q@
+z`w7(>z24Lp`2BM{cUDsx(fd3RSzb@F4+>c@#rf^w3hfr10qAW^z&0sKS`fj12!hK#
+zT=4`ILVpO=sE6wHi@+?lF2y$p*oF}eg(Dq7tHh;Opa}LE7*ELu!@N4_b*OXaDJ}_m
+z;4>kL!*=JpRRy4tORcJOeU@-c4NCG5kt|C*Y=_<CgC6o@g2z5>taqy!h~kdl@N-+e
+z8`T&c$~(bLUt!32Y{#1aUvnCC7eI#XAL<`?|L?i>2mkMH_@5~2pZVX<?IZoeADpZI
+zK-T}fIeP|OSfu>F@xMh$WQYv_dH?q-$AJ8gsnwl%e$nk~vFoDEi40<P>2Dc@#<9{+
+zV&04hBXOKcJ_94(toLweP15SM;2p214mM2P4KN=S-#^{);90ZD!<}P|vijc~f4Ck_
+z-z6sTEP05<w0JyfibWPW{*pSTn0+aJGM69DNhEBhmXDr@Pr$8=t>XA4U@=u3)Qonv
+zFsaGqw2mQ?v0OV$m61{z5Q(XKzi9A|5J4HuBPMOrUXB`hFQlDdq6T{pRUQwYBO_z8
+zeHuVwGTXE(e&MfOnl2ak23t`7T44gvj5x$$idomnQ1s_Al1<irHxzGXn+d}EjD62z
+z<@AmH8SGw9-{=~|VH%xS)}cnKGZan7(53f<P|Ry45>W_-0HU|zxk#2hX}opL+3X{W
+zk|4Hb`ln|DN4l%Wh>LLm9(oO~YAdejtCzuZ=?WF4YE-)cVTYt2GW^Pe49V0XWTx<G
+zq&)6aoS?JI7a7ySu9qNVU)9Z%^u4B`uQ=Uo_jGcFZ&(HEm?gO-vhGLYhe&&sVn9m&
+za{K4{{}1zjKlNQdkRANfe5BWB`{NE$|KeBqKgGYw|NY7_U6O<{8`bGqs#pjtyMj%Y
+zaLo|L(?w*sZA9tNm6}avv^Ah2vi#nkS-@}dc{k3ZIVO9kH%FYz>fH);-elPd4<cR6
+zED|8d?m7V2cp1Gr5-O<MXbr1T#9W}Cnz*w9$^RiRzl}K3TRpu>-nApDJ#l<P$-ZVh
+z$Rur11_6f@SG1~{00F|xXdGhdVk1ZI_$2xzycN;HNg>8<g2S;Tq1WOIsQUodvM|<U
+z#vpS5_D_;J7FjK<H2<!a0TDuoTPDP|c&qfV44r3DRw1Iy(Io#hBtb~pyd|_4oP8Z*
+z#APtdoo<X6%1sfk17eKd1vdb9T^epiZfPUh2YO<fc{gpbEjO|3wcVWb!MIu-ZYB2T
+z<cItOC@=J33o7o7q2oKSt>R==jwgF~r)*py4Bo5w9}YF?E_^x0Kyr%hhLXaovjq>y
+z)91Yn^_s=C+EtSS5sWb<H@(n|wb&cyS@9_3w#uT`cfXrdI2J9JDwS)btt|?wtH6D{
+z)kDTMC2p%}v4!Few@)XFT_>6A?!9=>tFEXyP}mMbQn%R1qBw}xxfvUX|I1G0%YRb;
+z|NrFwZvHX<7x82M@7Ii_f>4&sdHt)#qs{9rt8WNDo6OHdzD~_;JbzQ}7T4o2lvhfw
+zVtYGzorN7{28Mt+U%Cko0m$wc=zVx?7k}YaC?Q(WREL#h9`#-9QX2HXG`q3`4}`|l
+zA4o0ntbSBOqpLyhcZiLL+V&2ORmz$T@r5{MEGCfTUA=Nfy87&NP+z6QchwC@5nj4(
+z3auw(8w?~=c0~4T1p(2MfyT8x(xAh}_MSUK)}n%RatPzN<&Yra44u4Op*7&CX;2o%
+z^p0MGs*I}?p?kyucK8eKuv!OYVaYAwvMD1fFV|UpBP`Qu3Nnad7NU+RW2dtnol7%P
+z&GovhFzUPM2AENU5Y=sX_d$m%qF86*do7-P^4pH&YFlL({P%ZQ%5IiVqD5RvcMOmu
+z;$heDOEXP^0kx4%Zj6!fp)0bYeHGu^E@xcyVQ=_gwx75f-b--wH9w#Qrg;R;7<puR
+zQ8*=l@Hvp)i=@8K+I~yc5|X?_?fxz@0T$4u$+U5PB6t}Aglkaii#;6xB7oH)%)AV`
+zM%GgnTZ$6jygOXPyd===hUj${;nsMl&TWut{;N*p->m=tf5`vE0r@|G|NSBVcjf;O
+z18ne@jp>4f9-?%Sr&4VJpzJy{cWlhcgrE=)<nCZXQ#lfDpRDoPm8xlYt3TF8IUJR@
+z?wBfijBaCfnVBQnz0U4^o<B(=fN;Mn#PcBTDggMd%4^;P*{IXwIGk|fmGZ1|tje>q
+z{ozDbF0)wSM2%rV7XR}1Zqiq|yK1NN710F?!#B2%qX^=a`m?UWdsYmycPC)fN_Fbf
+zfgoaZHC7hZ?1j4nHB#ur5*ju3K5EG0LY5f}888(Vk(ebhUoBb<!EZ^#)x-`6Y5LUd
+zbc@q##5`s@2M7@wTEd$8Iq}VCNwiQrt?`v;tAhj)r5sy_yl?o4$$ferzU6EA6D|nh
+zcYnx5@BXDgL>J1f_Oypyw&AP8Zc*zNtpb?yA@?^eA+_q^VId1zHp3m3mUXjbmqK+Y
+zp9+?Jd{p_T!~dJ(57%S#Kg<87f}<W?6Tqvr_h09KFk4A|{x$#elly*L`d_z!{7<@}
+zBqkN0|H9sQNvY_K4h}+PR7`^gcVdwJ;xSUFFOewfm>j(7-yJhR<GGZ~{Ok{#z|kG`
+z8|S7kUxqfFf8aL}2{A9jZ#HCcghcn0Fq?|q*R_h(Fc*Q?9bCkX^G2=Ta(4i4)3n7^
+zdE|yFp&7i@zZ54SK1s3(hVxZz?`A2WQowO5ryu$#Cxs8B|0eb$WmMbny-YzV8~-II
+z(Q_>z9Xp6rLJXvCgwEyN5^}qA1KQ761TFGOj6E047C_(*6cuAv=&wI<H{Q^@FywGz
+zwODJL&3IHP6fcoXsh#7u=-;QOTJXMxz6M{ujYV<~lw$4#g?`SJi81p0%=sp!2PE;Z
+zW~7B>lTezqairaK(|)uFqGjc^hxDQ5&3_lFlH@EPMipx_tMjS3c;d?VO(zl2o#E_<
+zWqdmcKnf8=nK`-sIQAfnDo)o-|NcR(*{EyJ`2I(IQDX!po6twSH^1Jq_ms)0oC4B+
+zc#rXT&p9b&?9Kgn$<v*lC}fVOe3J&^e;{=EEr&Nfu3{KcZ#YVlPqaAJAzsy5NjjVF
+zo$Bv`Shk`D#1IR46O!ynfKJWBDVU5V_l|>haHIc}Y6Shr>jteO&zRBu^uR1t{IP!b
+WqWJykFP!cUssnM&Sen2~{r?Bqm$e80
+
+literal 0
+HcmV?d00001
+
+diff --git a/playback/media3/exoplayer/src/test/resources/iec/truehd.thd b/playback/media3/exoplayer/src/test/resources/iec/truehd.thd
+new file mode 100644
+index 0000000000000000000000000000000000000000..108c02e938d05efd38793634b48dd0e9d3225f36
+GIT binary patch
+literal 27968
+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
+
+literal 0
+HcmV?d00001
+
+-- 
+2.53.0
+
