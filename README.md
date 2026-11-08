@@ -16,6 +16,7 @@ Samsung S89C (HDR10/HDR10+, no Dolby Vision), Jellyfin server 12.2.0.
 | Dolby Vision profile 7 → 8.1 (libdovi), and a "Dolby Vision files" output setting (DV / HDR10+ / HDR10) | [docs/dolby-vision.md](docs/dolby-vision.md) | [patches/dovi](patches/dovi), [native/doviconv](native/doviconv) |
 | Does the DV engine apply the metadata? Camera measurements with synthetic clips | [docs/dv-metadata-test.md](docs/dv-metadata-test.md) | [test-media](test-media) |
 | Feature request draft for Media3: IEC 61937 output in the library | [docs/media3-iec61937.md](docs/media3-iec61937.md) | — |
+| Dolby Vision **FEL** on a **rooted** Cube (kernel fixes + amstream player; device- and firmware-specific, not a general Jellyfin feature) | [docs/fel-fire-cube.md](docs/fel-fire-cube.md) | [fel](fel), [patches/fel](patches/fel) |
 
 ## Applying the patches
 

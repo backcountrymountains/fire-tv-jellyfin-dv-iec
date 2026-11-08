@@ -1,0 +1,9 @@
+allow untrusted_app codec_device chr_file { open read write ioctl getattr }
+allow untrusted_app vendor_video_device chr_file { open read write ioctl getattr }
+allow untrusted_app sysfs_video file { open read write getattr }
+allow untrusted_app sysfs_xbmc file { open read write getattr }
+allow untrusted_app sysfs_video dir { search getattr }
+typeattribute codec_device mlstrustedobject
+typeattribute vendor_video_device mlstrustedobject
+typeattribute sysfs_video mlstrustedobject
+typeattribute sysfs_xbmc mlstrustedobject

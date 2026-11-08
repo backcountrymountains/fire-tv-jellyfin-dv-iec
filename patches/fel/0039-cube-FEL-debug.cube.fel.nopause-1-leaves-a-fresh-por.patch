@@ -1,0 +1,27 @@
+From c5d906a5d3b655d85586593395a44bfa3be5cb7e Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 08:10:14 -0700
+Subject: [PATCH 39/39] cube: FEL debug.cube.fel.nopause=1 leaves a fresh port
+ unpaused after a seek (A/B tool; no effect on EL drops)
+
+---
+ .../playback/media3/exoplayer/dovi/FelVideoRenderer.java       | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+index 67d9a60dd..a05c534bf 100644
+--- a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+@@ -163,7 +163,8 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 			// closing the port sets disable_video 1 (camera 2026-11-07: black after every seek until rewritten)
+ 			String dv = prop("debug.cube.fel.disable_video");
+ 			sysfs(DISABLE_VIDEO, dv.isEmpty() ? "0" : dv);
+-			pause(!started);
++			// debug.cube.fel.nopause=1: leave a fresh port running (pcrscr does not advance until onStarted)
++			if (!"1".equals(prop("debug.cube.fel.nopause"))) pause(!started);
+ 		}
+ 		clearSegment();
+ 		lastPositionUs = positionUs;
+-- 
+2.53.0
+

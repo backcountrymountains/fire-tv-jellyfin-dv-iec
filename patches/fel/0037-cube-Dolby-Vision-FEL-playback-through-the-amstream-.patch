@@ -1,0 +1,719 @@
+From 08fbb9c31e6813499b1ea328d0de7d57eecb4099 Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:26:44 -0700
+Subject: [PATCH] cube: Dolby Vision FEL playback through the amstream port
+ (libfelplay)
+
+Profile 7 (FEL and MEL) goes to FelVideoRenderer, which writes Annex-B
+samples (parameter sets prepended on keyframes) to /dev/amstream_dves_hevc
+via libfelplay.so (JNI, source fel/felplay) so the DV driver
+composes the enhancement layer. Pacing: tsync on, pts_pcrscr fed from the
+player position relative to the first sample written since the last
+(re)open; seeks reopen the port and use CLOSEST_SYNC. The picture is on the
+video plane under the window: FEL plays use a transparent shutter and a
+translucent (bufferless) SurfaceView. persist.cube.fel=0 turns it off;
+debug.cube.fel.voffset_ms shifts the video clock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../androidtv/ui/playback/VideoManager.java   |  55 +++
+ .../media3/exoplayer/dovi/FelPlay.java        |  57 +++
+ .../exoplayer/dovi/FelVideoRenderer.java      | 442 ++++++++++++++++++
+ .../src/main/kotlin/ExoPlayerBackend.kt       |  10 +
+ .../main/kotlin/audio/IecRenderersFactory.kt  |   4 +
+ 5 files changed, 568 insertions(+)
+ create mode 100644 playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelPlay.java
+ create mode 100644 playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+
+diff --git a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+index c877ca9f2..9d9499b03 100644
+--- a/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
++++ b/app/src/main/java/org/jellyfin/androidtv/ui/playback/VideoManager.java
+@@ -38,6 +38,7 @@ import androidx.media3.datasource.HttpDataSource;
+ import androidx.media3.exoplayer.DefaultLoadControl;
+ import androidx.media3.exoplayer.DefaultRenderersFactory;
+ import androidx.media3.exoplayer.ExoPlayer;
++import androidx.media3.exoplayer.SeekParameters;
+ import androidx.media3.exoplayer.analytics.AnalyticsListener;
+ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+ import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
+@@ -100,6 +101,8 @@ public class VideoManager {
+     private static final double LIVE_PLAYLIST_STUCK_TARGET_DURATION_COEFFICIENT = 1000;
+     private HlsMediaSource.Factory hlsMediaSourceFactory;
+     private boolean videoEffectsSet;
++    /** Cube: the current play goes through FelVideoRenderer (keyframe seeks, transparent shutter). */
++    private boolean felMode;
+     private String videoEffectParameters;
+     private View assSubtitleView;
+     /** Cube: decoder names and the audio output encoding, for the info panel (Menu key). */
+@@ -143,6 +146,9 @@ public class VideoManager {
+         AssHandler assHandler = assDirectPlay ? new AssHandler(AssRenderType.OVERLAY_OPEN_GL, new AssHandlerConfig()) : null;
+ 
+         mExoPlayer = configureExoplayerBuilder(mActivity, assHandler).build();
++        // a new player starts with default seek parameters: put the views back to match
++        if (felMode) setFelViews(false);
++        felMode = false;
+         mExoPlayer.addAnalyticsListener(infoCollector);
+         // LOCAL ONLY (cube-local): nominal seek so playback runs on a reused IEC track
+         ExoPlayer nominalSeekPlayer = mExoPlayer;
+@@ -229,6 +235,16 @@ public class VideoManager {
+             @Override
+             public void onTracksChanged(Tracks tracks) {
+                 Timber.d("Tracks changed");
++                // LOCAL ONLY (cube-local): confirm FEL mode from the selected video track
++                for (Tracks.Group group : tracks.getGroups()) {
++                    if (group.getType() != C.TRACK_TYPE_VIDEO || !group.isSelected()) continue;
++                    for (int i = 0; i < group.length; i++) {
++                        if (group.isTrackSelected(i)) {
++                            setFelMode(org.jellyfin.playback.media3.exoplayer.dovi.FelVideoRenderer.handles(group.getTrackFormat(i)));
++                            return;
++                        }
++                    }
++                }
+             }
+         });
+     }
+@@ -263,6 +279,11 @@ public class VideoManager {
+                 doviOutputMode != org.jellyfin.androidtv.preference.constant.DoviOutputMode.DOLBY_VISION;
+         org.jellyfin.playback.media3.exoplayer.dovi.DvVideoRenderer.stripHdr10Plus =
+                 doviOutputMode == org.jellyfin.androidtv.preference.constant.DoviOutputMode.BASE_LAYER_HDR10;
++        // LOCAL ONLY (cube-local): profile 7 through the amstream DV port (FEL) only when Dolby Vision output is chosen
++        // and the renderer exists (IecRenderersFactory adds it)
++        org.jellyfin.playback.media3.exoplayer.dovi.FelVideoRenderer.allowed =
++                doviOutputMode == org.jellyfin.androidtv.preference.constant.DoviOutputMode.DOLBY_VISION
++                        && defaultRendererFactory instanceof IecRenderersFactory;
+         defaultRendererFactory.setEnableDecoderFallback(true);
+         defaultRendererFactory.setExtensionRendererMode(determineExoPlayerExtensionRendererMode());
+ 
+@@ -412,6 +433,29 @@ public class VideoManager {
+         stopProgressLoop();
+     }
+ 
++    /**
++     * LOCAL ONLY (cube-local): FelVideoRenderer draws on the video plane under the window, so the shutter (black until
++     * a first frame that never comes through the Surface) must be transparent; its frame-counting clock also needs
++     * seeks to land exactly on a keyframe.
++     */
++    private void setFelMode(boolean on) {
++        if (on == felMode || mExoPlayer == null) return;
++        felMode = on;
++        Timber.i("FEL mode %s", on ? "on: keyframe seeks, transparent shutter" : "off");
++        mExoPlayer.setSeekParameters(on ? SeekParameters.CLOSEST_SYNC : SeekParameters.DEFAULT);
++        setFelViews(on);
++    }
++
++    private void setFelViews(boolean on) {
++        mExoPlayerView.setShutterBackgroundColor(on ? Color.TRANSPARENT : Color.BLACK);
++        // An opaque SurfaceView (default RGB_565) gets a black colour layer behind it; a translucent one with no
++        // buffer leaves the hole see-through to the video plane
++        View surfaceView = mExoPlayerView.getVideoSurfaceView();
++        if (surfaceView instanceof android.view.SurfaceView) {
++            ((android.view.SurfaceView) surfaceView).getHolder().setFormat(on ? android.graphics.PixelFormat.TRANSLUCENT : android.graphics.PixelFormat.RGB_565);
++        }
++    }
++
+     public boolean isSeekable() {
+         if (!isInitialized())
+             return false;
+@@ -470,6 +514,15 @@ public class VideoManager {
+                     .setSubtitleConfigurations(subtitleConfigurations)
+                     .build();
+ 
++            // LOCAL ONLY (cube-local): Dolby Vision profile 7 goes to FelVideoRenderer; switch before prepare so the
++            // resume seek already lands on a keyframe (onTracksChanged confirms it from the real track)
++            boolean felExpected = false;
++            if (org.jellyfin.playback.media3.exoplayer.dovi.FelVideoRenderer.isEnabled()) {
++                for (MediaStream mediaStream : streamInfo.getMediaSource().getMediaStreams()) {
++                    if (mediaStream.getType() == MediaStreamType.VIDEO && Integer.valueOf(7).equals(mediaStream.getDvProfile())) felExpected = true;
++                }
++            }
++
+             // LOCAL ONLY (cube-local): SDR video in Always HDR plays through GPU effects. Any setVideoEffects call,
+             // even an empty list, puts the player on the GPU path, so only call it when effects are wanted.
+             boolean effectsWanted = SdrInHdrEffects.wantedFor(
+@@ -490,6 +543,8 @@ public class VideoManager {
+                 videoEffectsSet = false;
+             }
+ 
++            setFelMode(felExpected);
++
+             // HLS gets a TS extractor that survives corrupt broadcast audio; sideloaded subtitles need the default factory
+             if (subtitleConfigurations.isEmpty() && Util.inferContentType(mediaItem.localConfiguration.uri) == C.CONTENT_TYPE_HLS) {
+                 mExoPlayer.setMediaSource(hlsMediaSourceFactory.createMediaSource(mediaItem));
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelPlay.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelPlay.java
+new file mode 100644
+index 000000000..732e5e63f
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelPlay.java
+@@ -0,0 +1,57 @@
++package org.jellyfin.playback.media3.exoplayer.dovi;
++
++import android.util.Log;
++import androidx.annotation.Nullable;
++import java.nio.ByteBuffer;
++
++/**
++ * libfelplay (libfelplay.so, source fel/felplay in the fire-tv-jellyfin-dv-iec repo): the Amlogic amstream Dolby Vision
++ * dual-layer HEVC port, written directly so FEL composes in the DV driver. Negative returns are -errno;
++ * {@link #EAGAIN} from a write means the port is full and the same AU must be retried later.
++ */
++public final class FelPlay {
++	static final String TAG = "CubeFel";
++	public static final int EAGAIN = -11;
++	static final boolean AVAILABLE;
++
++	static {
++		boolean ok;
++		try {
++			System.loadLibrary("felplay");
++			ok = true;
++		} catch (UnsatisfiedLinkError e) {
++			Log.w(TAG, "libfelplay not loaded: " + e.getMessage());
++			ok = false;
++		}
++		AVAILABLE = ok;
++	}
++
++	/** Handle (> 0) or -errno. Opens /dev/amstream_dves_hevc when {@code dv}, without PTS check-in. */
++	static native long nOpen(int width, int height, int fpsNum, int fpsDen, boolean dv);
++
++	/** Writes direct-buffer bytes [off, off + len) as one AU; len, {@link #EAGAIN} or -errno. Never blocks. */
++	static native int nWriteDirect(long handle, ByteBuffer buffer, int off, int len, long ptsUs);
++
++	static native int nWriteArray(long handle, byte[] data, int off, int len, long ptsUs);
++
++	static native int nSetPcrscr(long handle, int pts90k);
++
++	static native int nPause(long handle, boolean on);
++
++	/** Close + reopen with the same configuration (flush for a seek). */
++	static native int nReset(long handle);
++
++	static native void nClose(long handle);
++
++	/** AMSTREAM_GET_VPTS in 90 kHz ticks, or -1. */
++	static native long nGetVpts(long handle);
++
++	/** Writes {@code value} to a sysfs node; 0 or -errno. */
++	static native int sysfsWrite(String path, String value);
++
++	/** Contents of a sysfs node (up to 4 KiB), or null. */
++	@Nullable
++	static native String sysfsRead(String path);
++
++	private FelPlay() {}
++}
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+new file mode 100644
+index 000000000..f9cdb6e59
+--- /dev/null
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+@@ -0,0 +1,442 @@
++package org.jellyfin.playback.media3.exoplayer.dovi;
++
++import android.os.SystemClock;
++import android.util.Log;
++import androidx.annotation.Nullable;
++import androidx.media3.common.C;
++import androidx.media3.common.Format;
++import androidx.media3.common.MimeTypes;
++import androidx.media3.common.PlaybackException;
++import androidx.media3.decoder.DecoderInputBuffer;
++import androidx.media3.exoplayer.BaseRenderer;
++import androidx.media3.exoplayer.ExoPlaybackException;
++import androidx.media3.exoplayer.FormatHolder;
++import androidx.media3.exoplayer.RendererCapabilities;
++import androidx.media3.exoplayer.source.MediaSource;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.util.List;
++
++/**
++ * LOCAL ONLY (cube-local): Dolby Vision profile 7 (FEL and MEL) through the Amlogic amstream dual-layer port
++ * (libfelplay), so the DV driver composes the enhancement layer. No MediaCodec and no Surface: the picture is on the
++ * video plane under the app's window, which must leave a transparent hole (PlayerView's SurfaceView does).
++ *
++ * <p>Pacing: FireOS's parser-less port ignores checked-in PTS and numbers frames from 0 at the first output picture,
++ * so tsync is enabled and {@code pts_pcrscr} is fed relative to the first sample written since the last (re)open:
++ * {@code (positionUs - segMinPtsUs + offset) * 9 / 100}. Seeks reopen the port (Kodi's flush) and must land on a
++ * keyframe ({@code SeekParameters.CLOSEST_SYNC}, set by the app). See docs/fel-fire-cube.md "Pacing and the app".
++ *
++ * <p>Switches: {@code persist.cube.fel} = 0 turns it off (DvVideoRenderer takes P7 again);
++ * {@code debug.cube.fel.voffset_ms} shifts the video clock (A/V tuning, read per open);
++ * {@code debug.cube.fel.disable_video} (if set) is written to /sys/class/video/disable_video for the play.
++ */
++public final class FelVideoRenderer extends BaseRenderer {
++	private static final String TAG = FelPlay.TAG;
++	private static final long MAX_AHEAD_US = 2_000_000;
++	private static final long READY_AHEAD_US = 500_000;
++	private static final long PCR_INTERVAL_MS = 20;
++	private static final long STATS_INTERVAL_MS = 5_000;
++	private static final long RENDER_BUDGET_MS = 15;
++
++	private static final String TSYNC_ENABLE = "/sys/class/tsync/enable";
++	private static final String VFM_MAP = "/sys/class/vfm/map";
++	private static final String DISABLE_VIDEO = "/sys/class/video/disable_video";
++	private static final String PCRSCR = "/sys/class/tsync/pts_pcrscr";
++	private static final String DVBL_FEL = "dvbldec amvideo";
++
++	/** Set by the app: false when the Dolby Vision output setting asks for the base layer. */
++	public static volatile boolean allowed = true;
++
++	private final FormatHolder formatHolder = new FormatHolder();
++	private final DecoderInputBuffer buffer = new DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_DIRECT);
++
++	@Nullable private Format format;
++	private byte[] csd = new byte[0];
++	private long handle;
++	private int width, height, fpsNum, fpsDen;
++	private long frameDurationUs = 41_708;
++	private long offsetUs;
++
++	@Nullable private String savedTsync;
++	@Nullable private String savedDvbl;
++	@Nullable private String savedDisableVideo;
++
++	@Nullable private ByteBuffer au;
++	private int auLen;
++	private long auPtsUs;
++	private boolean auPending;
++
++	private boolean started;
++	private boolean eosRead;
++	private boolean portFull;
++	private boolean readyOnce;
++	private boolean pcrDirty;
++	private boolean wroteSinceOpen;
++	private long segMinPtsUs = C.TIME_UNSET;
++	private long maxWrittenPtsUs = C.TIME_UNSET;
++	private long lastPositionUs;
++	private long lastPcrMs;
++
++	private long statsStartMs;
++	private long statsEagain, statsWritten, statsBytes;
++	private long totalWritten, totalEagain, resets;
++
++	public FelVideoRenderer() {
++		super(C.TRACK_TYPE_VIDEO);
++	}
++
++	// ---- selection -------------------------------------------------------------------------------------------
++
++	/** Reads an Android system property ("" if unset or unreadable). */
++	static String prop(String name) {
++		try {
++			Object v = Class.forName("android.os.SystemProperties").getMethod("get", String.class).invoke(null, name);
++			return v == null ? "" : v.toString().trim();
++		} catch (ReflectiveOperationException e) {
++			Log.w(TAG, "SystemProperties.get(" + name + ") failed: " + e);
++			return "";
++		}
++	}
++
++	/** FEL playback is on: library loaded, app setting allows Dolby Vision, {@code persist.cube.fel} != 0. */
++	public static boolean isEnabled() {
++		return allowed && FelPlay.AVAILABLE && !"0".equals(prop("persist.cube.fel"));
++	}
++
++	static boolean isP7(@Nullable Format f) {
++		return f != null && f.codecs != null && f.codecs.startsWith("dvhe.07")
++				&& (MimeTypes.VIDEO_DOLBY_VISION.equals(f.sampleMimeType) || MimeTypes.VIDEO_H265.equals(f.sampleMimeType));
++	}
++
++	/** True if this renderer would take {@code format} (the app uses it to switch the player into FEL mode). */
++	public static boolean handles(@Nullable Format f) {
++		return isP7(f) && isEnabled();
++	}
++
++	@Override
++	public String getName() {
++		return "FelVideoRenderer";
++	}
++
++	@Override
++	public int supportsFormat(Format f) {
++		if (!MimeTypes.isVideo(f.sampleMimeType)) return RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE);
++		return RendererCapabilities.create(handles(f) ? C.FORMAT_HANDLED : C.FORMAT_UNSUPPORTED_SUBTYPE);
++	}
++
++	// ---- lifecycle -------------------------------------------------------------------------------------------
++
++	@Override
++	protected void onEnabled(boolean joining, boolean mayRenderStartOfStream) {
++		started = false;
++		totalWritten = totalEagain = resets = 0;
++		clearSegment();
++	}
++
++	@Override
++	protected void onStreamChanged(Format[] formats, long startPositionUs, long offsetUs, MediaSource.MediaPeriodId mediaPeriodId)
++			throws ExoPlaybackException {
++		Format f = formats.length > 0 ? formats[0] : null;
++		if (f == null) return;
++		setFormat(f);
++		if (handle == 0) {
++			open(f);
++		} else if (f.width != width || f.height != height) {
++			Log.w(TAG, "stream changed to " + f.width + "x" + f.height + " on an open " + width + "x" + height + " port (kept)");
++		}
++	}
++
++	@Override
++	protected void onPositionReset(long positionUs, boolean joining, boolean sampleStreamIsResetToKeyFrame) throws ExoPlaybackException {
++		if (handle != 0 && wroteSinceOpen) {
++			int r = FelPlay.nReset(handle);
++			resets++;
++			Log.i(TAG, "reset to " + positionUs / 1000 + " ms (keyframe reset " + sampleStreamIsResetToKeyFrame + "): " + r);
++			if (r < 0) throw fail("fp_reset " + r, PlaybackException.ERROR_CODE_DECODER_INIT_FAILED);
++			wroteSinceOpen = false;
++			pause(!started);
++		}
++		clearSegment();
++		lastPositionUs = positionUs;
++	}
++
++	@Override
++	protected void onStarted() {
++		started = true;
++		writePcr(lastPositionUs, true);
++		pause(false);
++	}
++
++	@Override
++	protected void onStopped() {
++		started = false;
++		pause(true);
++	}
++
++	@Override
++	protected void onDisabled() {
++		close();
++		format = null;
++	}
++
++	@Override
++	protected void onReset() {
++		close();
++	}
++
++	private void clearSegment() {
++		auPending = false;
++		auLen = 0;
++		eosRead = false;
++		portFull = false;
++		readyOnce = false;
++		pcrDirty = false;
++		segMinPtsUs = C.TIME_UNSET;
++		maxWrittenPtsUs = C.TIME_UNSET;
++		buffer.clear();
++	}
++
++	private void setFormat(Format f) {
++		format = f;
++		ByteArrayOutputStream out = new ByteArrayOutputStream();
++		List<byte[]> init = f.initializationData;
++		for (byte[] b : init) {
++			boolean annexB = b.length > 4 && b[0] == 0 && b[1] == 0 && (b[2] == 1 || (b[2] == 0 && b[3] == 1));
++			if (annexB) out.write(b, 0, b.length);
++			else Log.w(TAG, "initialization data entry of " + b.length + " bytes is not Annex-B; skipped");
++		}
++		csd = out.toByteArray();
++	}
++
++	private void open(Format f) throws ExoPlaybackException {
++		width = f.width > 0 ? f.width : 3840;
++		height = f.height > 0 ? f.height : 2160;
++		float fps = f.frameRate;
++		if (fps <= 0) {
++			fpsNum = 24000; fpsDen = 1001;
++		} else if (Math.abs(fps - 23.976f) < 0.01f) {
++			fpsNum = 24000; fpsDen = 1001;
++		} else if (Math.abs(fps - 29.97f) < 0.01f) {
++			fpsNum = 30000; fpsDen = 1001;
++		} else if (Math.abs(fps - 59.94f) < 0.01f) {
++			fpsNum = 60000; fpsDen = 1001;
++		} else {
++			fpsNum = Math.round(fps * 1000); fpsDen = 1000;
++		}
++		frameDurationUs = 1_000_000L * fpsDen / fpsNum;
++		offsetUs = parseLong(prop("debug.cube.fel.voffset_ms")) * 1000;
++
++		savedTsync = trim(FelPlay.sysfsRead(TSYNC_ENABLE));
++		savedDvbl = dvblpath(FelPlay.sysfsRead(VFM_MAP));
++		Log.i(TAG, "setup " + f.codecs + " " + width + "x" + height + " " + fpsNum + "/" + fpsDen + " csd=" + csd.length
++				+ " B offset=" + offsetUs / 1000 + " ms; tsync/enable=" + savedTsync + " dvblpath={" + savedDvbl + "} disable_video="
++				+ trim(FelPlay.sysfsRead(DISABLE_VIDEO)));
++		// must be in place before PORT_INIT
++		sysfs(VFM_MAP, "rm dvblpath");
++		sysfs(VFM_MAP, "add dvblpath " + DVBL_FEL);
++
++		long h = FelPlay.nOpen(width, height, fpsNum, fpsDen, true);
++		if (h <= 0) {
++			restoreSysfs();
++			throw fail("fp_open " + h, PlaybackException.ERROR_CODE_DECODER_INIT_FAILED);
++		}
++		handle = h;
++		wroteSinceOpen = false;
++		sysfs(TSYNC_ENABLE, "1");
++		String dv = prop("debug.cube.fel.disable_video");
++		if (!dv.isEmpty()) {
++			savedDisableVideo = trim(FelPlay.sysfsRead(DISABLE_VIDEO));
++			sysfs(DISABLE_VIDEO, dv);
++		}
++		pause(!started);
++		statsStartMs = SystemClock.elapsedRealtime();
++		statsEagain = statsWritten = statsBytes = 0;
++		Log.i(TAG, "port open");
++	}
++
++	private void close() {
++		if (handle != 0) {
++			FelPlay.nPause(handle, false); // VPAUSE is global to amvideo: never leave it set for the next player
++			FelPlay.nClose(handle);
++			handle = 0;
++			Log.i(TAG, "closed: " + totalWritten + " AUs written, " + totalEagain + " EAGAIN, " + resets + " resets");
++			restoreSysfs();
++		}
++		clearSegment();
++		au = null;
++	}
++
++	private void restoreSysfs() {
++		if (savedTsync != null) sysfs(TSYNC_ENABLE, savedTsync);
++		if (savedDvbl != null && !savedDvbl.equals(DVBL_FEL)) {
++			sysfs(VFM_MAP, "rm dvblpath");
++			sysfs(VFM_MAP, "add dvblpath " + savedDvbl);
++		}
++		if (savedDisableVideo != null) sysfs(DISABLE_VIDEO, savedDisableVideo);
++		savedTsync = savedDvbl = savedDisableVideo = null;
++	}
++
++	private void pause(boolean on) {
++		if (handle == 0) return;
++		int r = FelPlay.nPause(handle, on);
++		Log.i(TAG, (on ? "pause" : "resume") + (r < 0 ? " failed: " + r : ""));
++	}
++
++	// ---- feeding and clock -----------------------------------------------------------------------------------
++
++	@Override
++	public void render(long positionUs, long elapsedRealtimeUs) throws ExoPlaybackException {
++		if (handle == 0) return;
++		lastPositionUs = positionUs;
++		long t0 = SystemClock.elapsedRealtime();
++		while (SystemClock.elapsedRealtime() - t0 < RENDER_BUDGET_MS) {
++			if (!auPending) {
++				if (eosRead) break;
++				if (maxWrittenPtsUs != C.TIME_UNSET && maxWrittenPtsUs - positionUs >= MAX_AHEAD_US) break;
++				buffer.clear();
++				int result = readSource(formatHolder, buffer, 0);
++				if (result == C.RESULT_NOTHING_READ) break;
++				if (result == C.RESULT_FORMAT_READ) {
++					if (formatHolder.format != null) setFormat(formatHolder.format);
++					continue;
++				}
++				if (buffer.isEndOfStream()) {
++					eosRead = true;
++					Log.i(TAG, "end of stream read, last pts " + (maxWrittenPtsUs == C.TIME_UNSET ? -1 : maxWrittenPtsUs / 1000) + " ms");
++					break;
++				}
++				if (buffer.data == null) continue;
++				buffer.flip();
++				stageAu(buffer.data, buffer.isKeyFrame(), buffer.timeUs);
++			}
++			int w = FelPlay.nWriteDirect(handle, au, 0, auLen, auPtsUs);
++			if (w == FelPlay.EAGAIN) {
++				portFull = true;
++				statsEagain++;
++				totalEagain++;
++				break;
++			}
++			if (w < 0) throw fail("fp_write " + w, PlaybackException.ERROR_CODE_DECODING_FAILED);
++			auPending = false;
++			portFull = false;
++			wroteSinceOpen = true;
++			statsWritten++;
++			totalWritten++;
++			statsBytes += auLen;
++			if (segMinPtsUs == C.TIME_UNSET || auPtsUs < segMinPtsUs) {
++				segMinPtsUs = auPtsUs;
++				pcrDirty = true;
++			}
++			if (maxWrittenPtsUs == C.TIME_UNSET || auPtsUs > maxWrittenPtsUs) maxWrittenPtsUs = auPtsUs;
++		}
++		writePcr(positionUs, false);
++		logStats(positionUs);
++	}
++
++	/** Copies one sample (with the parameter sets in front on keyframes) into the pending AU buffer. */
++	private void stageAu(ByteBuffer data, boolean keyFrame, long timeUs) {
++		int prefix = keyFrame ? csd.length : 0;
++		int need = prefix + data.remaining();
++		if (au == null || au.capacity() < need) au = ByteBuffer.allocateDirect(Math.max(need + need / 2, 1 << 20));
++		au.clear();
++		if (prefix > 0) au.put(csd);
++		au.put(data);
++		auLen = au.position();
++		auPtsUs = timeUs;
++		auPending = true;
++	}
++
++	private void writePcr(long positionUs, boolean force) {
++		if (handle == 0 || segMinPtsUs == C.TIME_UNSET) return;
++		long now = SystemClock.elapsedRealtime();
++		if (!force && !pcrDirty && !(started && now - lastPcrMs >= PCR_INTERVAL_MS)) return;
++		long v = Math.max(0, positionUs - segMinPtsUs + offsetUs) * 9 / 100;
++		int r = FelPlay.nSetPcrscr(handle, (int) (v & 0xffffffffL));
++		if (r < 0) Log.w(TAG, "set pcrscr failed: " + r);
++		lastPcrMs = now;
++		pcrDirty = false;
++	}
++
++	private void logStats(long positionUs) {
++		long now = SystemClock.elapsedRealtime();
++		long dt = now - statsStartMs;
++		if (dt < STATS_INTERVAL_MS) return;
++		long rel = segMinPtsUs == C.TIME_UNSET ? -1 : (positionUs - segMinPtsUs + offsetUs) / 1000;
++		long vpts = FelPlay.nGetVpts(handle);
++		Log.i(TAG, "clock " + rel + " ms, vpts " + (vpts < 0 ? -1 : vpts / 90) + " ms, pcrscr " + trim(FelPlay.sysfsRead(PCRSCR))
++				+ ", ahead " + (maxWrittenPtsUs == C.TIME_UNSET ? -1 : (maxWrittenPtsUs - positionUs) / 1000) + " ms, "
++				+ statsWritten * 1000 / dt + " AU/s, " + statsBytes * 8 / 1000 / dt + " kbit/s, EAGAIN " + statsEagain * 1000 / dt + "/s"
++				+ (started ? "" : " (stopped)"));
++		statsStartMs = now;
++		statsEagain = statsWritten = statsBytes = 0;
++	}
++
++	@Override
++	public boolean isReady() {
++		if (handle == 0) return false;
++		if (eosRead || portFull) return true;
++		if (maxWrittenPtsUs == C.TIME_UNSET) return false;
++		long ahead = maxWrittenPtsUs - lastPositionUs;
++		if (ahead >= READY_AHEAD_US || (readyOnce && ahead > 0)) {
++			readyOnce = true;
++			return true;
++		}
++		return false;
++	}
++
++	@Override
++	public boolean isEnded() {
++		return eosRead && !auPending && (maxWrittenPtsUs == C.TIME_UNSET || lastPositionUs >= maxWrittenPtsUs + frameDurationUs);
++	}
++
++	// ---- helpers ---------------------------------------------------------------------------------------------
++
++	private ExoPlaybackException fail(String what, int errorCode) {
++		Log.e(TAG, what);
++		return createRendererException(new IOException("FEL port: " + what), format, errorCode);
++	}
++
++	private static void sysfs(String path, String value) {
++		int r = FelPlay.sysfsWrite(path, value);
++		if (r < 0) Log.w(TAG, "write " + path + " <- '" + value + "' failed: " + r);
++	}
++
++	@Nullable
++	private static String trim(@Nullable String s) {
++		return s == null ? null : s.trim();
++	}
++
++	private static long parseLong(String s) {
++		try {
++			return s.isEmpty() ? 0 : Long.parseLong(s);
++		} catch (NumberFormatException e) {
++			Log.w(TAG, "bad number '" + s + "'");
++			return 0;
++		}
++	}
++
++	/** The dvblpath chain of /sys/class/vfm/map ("[02]  dvblpath { dvbldec(0) amvideo}" -> "dvbldec amvideo"), or null. */
++	@Nullable
++	static String dvblpath(@Nullable String map) {
++		if (map == null) return null;
++		for (String line : map.split("\n")) {
++			int s = line.indexOf("dvblpath {");
++			if (s < 0) continue;
++			String l = line.substring(s);
++			int a = l.indexOf('{'), b = l.indexOf('}', a + 1);
++			if (a < 0 || b < 0) return null;
++			StringBuilder sb = new StringBuilder();
++			for (String tok : l.substring(a + 1, b).trim().split("\\s+")) {
++				int p = tok.indexOf('(');
++				String name = p >= 0 ? tok.substring(0, p) : tok;
++				if (name.isEmpty()) continue;
++				if (sb.length() > 0) sb.append(' ');
++				sb.append(name);
++			}
++			return sb.length() > 0 ? sb.toString() : null;
++		}
++		return null;
++	}
++}
+diff --git a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
+index fbac78869..a39454c5d 100644
+--- a/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
++++ b/playback/media3/exoplayer/src/main/kotlin/ExoPlayerBackend.kt
+@@ -11,6 +11,7 @@ import androidx.media3.common.PlaybackException
+ import androidx.media3.common.Player
+ import androidx.media3.common.Timeline
+ import androidx.media3.common.TrackSelectionParameters
++import androidx.media3.common.Tracks
+ import androidx.media3.common.VideoSize
+ import androidx.media3.common.text.CueGroup
+ import androidx.media3.common.util.UnstableApi
+@@ -18,6 +19,7 @@ import androidx.media3.datasource.DefaultDataSource
+ import androidx.media3.exoplayer.DefaultLoadControl
+ import androidx.media3.exoplayer.DefaultRenderersFactory
+ import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.SeekParameters
+ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+ import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+ import androidx.media3.exoplayer.util.EventLogger
+@@ -46,6 +48,7 @@ import org.jellyfin.playback.core.ui.PlayerSubtitleView
+ import org.jellyfin.playback.core.ui.PlayerSurfaceView
+ import org.jellyfin.playback.media3.exoplayer.audio.IecAudioOutputProvider
+ import org.jellyfin.playback.media3.exoplayer.audio.IecRenderersFactory
++import org.jellyfin.playback.media3.exoplayer.dovi.FelVideoRenderer
+ import org.jellyfin.playback.media3.exoplayer.support.getPlaySupportReport
+ import org.jellyfin.playback.media3.exoplayer.support.toFormats
+ import timber.log.Timber
+@@ -172,6 +175,13 @@ class ExoPlayerBackend(
+ 			listener?.onPlayStateChange(PlayState.ERROR)
+ 		}
+ 
++		// LOCAL ONLY (cube-local): FelVideoRenderer's frame-counting clock needs seeks to land on a keyframe
++		override fun onTracksChanged(tracks: Tracks) {
++			val video = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_VIDEO && it.isSelected } ?: return
++			val format = (0 until video.length).firstOrNull { video.isTrackSelected(it) }?.let { video.getTrackFormat(it) } ?: return
++			exoPlayer.setSeekParameters(if (FelVideoRenderer.handles(format)) SeekParameters.CLOSEST_SYNC else SeekParameters.DEFAULT)
++		}
++
+ 		override fun onVideoSizeChanged(size: VideoSize) {
+ 			if (size != VideoSize.UNKNOWN) {
+ 				listener?.onVideoSizeChange(size.width, size.height)
+diff --git a/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt b/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
+index 0a0ac88d6..dcca8ea80 100644
+--- a/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
++++ b/playback/media3/exoplayer/src/main/kotlin/audio/IecRenderersFactory.kt
+@@ -13,6 +13,7 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+ import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
+ import androidx.media3.exoplayer.video.VideoRendererEventListener
+ import org.jellyfin.playback.media3.exoplayer.dovi.DvVideoRenderer
++import org.jellyfin.playback.media3.exoplayer.dovi.FelVideoRenderer
+ 
+ /**
+  * [DefaultRenderersFactory] whose audio sink plays DTS, DTS-HD and TrueHD through [IecAudioOutputProvider].
+@@ -55,5 +56,8 @@ class IecRenderersFactory(context: Context) : DefaultRenderersFactory(context) {
+ 				.setEventListener(eventListener)
+ 				.setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
+ 		)
++		// LOCAL ONLY (cube-local): Dolby Vision profile 7 through the amstream DV port (FEL composed by the DV
++		// driver). Placed first so it wins the tie for dvhe.07; it reports UNSUPPORTED when off (persist.cube.fel=0).
++		out.add(index, FelVideoRenderer())
+ 	}
+ }
+-- 
+2.53.0
+

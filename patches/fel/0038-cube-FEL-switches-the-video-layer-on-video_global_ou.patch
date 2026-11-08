@@ -1,0 +1,91 @@
+From fb57e93593fbe13daf355ad4e591ecac66f83366 Mon Sep 17 00:00:00 2001
+From: Justin <backcountrymountains@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:54:10 -0700
+Subject: [PATCH 38/39] cube: FEL switches the video layer on
+ (video_global_output, disable_video) and re-enables it after a seek
+
+---
+ .../exoplayer/dovi/FelVideoRenderer.java      | 28 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+index f9cdb6e59..67d9a60dd 100644
+--- a/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
++++ b/playback/media3/exoplayer/src/main/java/org/jellyfin/playback/media3/exoplayer/dovi/FelVideoRenderer.java
+@@ -43,6 +43,9 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 	private static final String TSYNC_ENABLE = "/sys/class/tsync/enable";
+ 	private static final String VFM_MAP = "/sys/class/vfm/map";
+ 	private static final String DISABLE_VIDEO = "/sys/class/video/disable_video";
++	// The video layer's global switch: 0 after boot / other players, so nothing on amvideo shows (camera-verified
++	// 2026-11-07: FEL decoded and paced, screen black until 1). Root 0664 by default; the boot module makes it 0666.
++	private static final String GLOBAL_OUTPUT = "/sys/class/video/video_global_output";
+ 	private static final String PCRSCR = "/sys/class/tsync/pts_pcrscr";
+ 	private static final String DVBL_FEL = "dvbldec amvideo";
+ 
+@@ -62,6 +65,7 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 	@Nullable private String savedTsync;
+ 	@Nullable private String savedDvbl;
+ 	@Nullable private String savedDisableVideo;
++	@Nullable private String savedGlobalOutput;
+ 
+ 	@Nullable private ByteBuffer au;
+ 	private int auLen;
+@@ -156,6 +160,9 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 			Log.i(TAG, "reset to " + positionUs / 1000 + " ms (keyframe reset " + sampleStreamIsResetToKeyFrame + "): " + r);
+ 			if (r < 0) throw fail("fp_reset " + r, PlaybackException.ERROR_CODE_DECODER_INIT_FAILED);
+ 			wroteSinceOpen = false;
++			// closing the port sets disable_video 1 (camera 2026-11-07: black after every seek until rewritten)
++			String dv = prop("debug.cube.fel.disable_video");
++			sysfs(DISABLE_VIDEO, dv.isEmpty() ? "0" : dv);
+ 			pause(!started);
+ 		}
+ 		clearSegment();
+@@ -246,10 +253,10 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 		wroteSinceOpen = false;
+ 		sysfs(TSYNC_ENABLE, "1");
+ 		String dv = prop("debug.cube.fel.disable_video");
+-		if (!dv.isEmpty()) {
+-			savedDisableVideo = trim(FelPlay.sysfsRead(DISABLE_VIDEO));
+-			sysfs(DISABLE_VIDEO, dv);
+-		}
++		savedDisableVideo = trim(FelPlay.sysfsRead(DISABLE_VIDEO));
++		sysfs(DISABLE_VIDEO, dv.isEmpty() ? "0" : dv);
++		savedGlobalOutput = trim(FelPlay.sysfsRead(GLOBAL_OUTPUT));
++		sysfs(GLOBAL_OUTPUT, "1");
+ 		pause(!started);
+ 		statsStartMs = SystemClock.elapsedRealtime();
+ 		statsEagain = statsWritten = statsBytes = 0;
+@@ -269,13 +276,14 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 	}
+ 
+ 	private void restoreSysfs() {
+-		if (savedTsync != null) sysfs(TSYNC_ENABLE, savedTsync);
++		if (savedTsync != null) sysfs(TSYNC_ENABLE, lead(savedTsync));
+ 		if (savedDvbl != null && !savedDvbl.equals(DVBL_FEL)) {
+ 			sysfs(VFM_MAP, "rm dvblpath");
+ 			sysfs(VFM_MAP, "add dvblpath " + savedDvbl);
+ 		}
+-		if (savedDisableVideo != null) sysfs(DISABLE_VIDEO, savedDisableVideo);
+-		savedTsync = savedDvbl = savedDisableVideo = null;
++		if (savedDisableVideo != null) sysfs(DISABLE_VIDEO, lead(savedDisableVideo));
++		if (savedGlobalOutput != null) sysfs(GLOBAL_OUTPUT, lead(savedGlobalOutput));
++		savedTsync = savedDvbl = savedDisableVideo = savedGlobalOutput = null;
+ 	}
+ 
+ 	private void pause(boolean on) {
+@@ -404,6 +412,12 @@ public final class FelVideoRenderer extends BaseRenderer {
+ 	}
+ 
+ 	@Nullable
++	/** sysfs reads like "1: enabled"; write back only the leading value. */
++	private static String lead(String s) {
++		int i = s.indexOf(':');
++		return (i >= 0 ? s.substring(0, i) : s).trim();
++	}
++
+ 	private static String trim(@Nullable String s) {
+ 		return s == null ? null : s.trim();
+ 	}
+-- 
+2.53.0
+

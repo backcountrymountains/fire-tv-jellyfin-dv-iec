@@ -1,0 +1,6 @@
+id=cube-fel
+name=Fire TV Cube 3 Dolby Vision FEL (felfix)
+version=1.0
+versionCode=1
+author=
+description=Loads felfix kernel fixes and sets decoder params for FEL playback through the amstream port. Needs a FEL-capable DV core (not included). Disable to undo (next boot).
